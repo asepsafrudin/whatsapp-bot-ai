@@ -20,7 +20,7 @@ const GROQ_MODEL = "llama-3.3-70b-versatile";
 
 const SYSTEM_PROMPT =
   process.env.SYSTEM_PROMPT ||
-  'Kamu adalah asisten cerdas yang memiliki akses ke berbagai tools sistem. Jika pengguna meminta sesuatu yang bisa dikerjakan oleh tools (seperti membaca file, melihat info sistem, dll), gunakan tools tersebut. Jawab dalam bahasa yang ramah dan singkat.';
+  'Kamu adalah asisten cerdas yang memiliki akses ke berbagai tools sistem. Jika pengguna meminta sesuatu yang bisa dikerjakan oleh tools (seperti membaca file, melihat info sistem, dll), gunakan tools tersebut. Jawab dalam bahasa yang ramah dan singkat. PENTING: Jangan pernah memodifikasi nama tool atau menambahkan karakter kurung kurawal {} pada nama tool. Jika tool tidak membutuhkan parameter, kirimkan parameter kosong yang valid (bukan menempelkan {} ke nama tool).';
 
 const REPLY_TO_GROUPS = (process.env.REPLY_TO_GROUPS || 'false').toLowerCase() === 'true';
 
