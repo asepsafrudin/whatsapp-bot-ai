@@ -114,8 +114,9 @@ async function startBot() {
 
   sock.ev.on('messages.upsert', async ({ messages }) => {
     const msg = messages[0];
-    if (!msg.message || msg.key.fromMe) return;
+    if (!msg.message) return;
 
+    const isFromMe = msg.key.fromMe;
     const remoteJid = msg.key.remoteJid;
     const isGroup = remoteJid?.endsWith('@g.us');
     
@@ -126,6 +127,8 @@ async function startBot() {
       '';
 
     if (!text) return;
+
+    console.log(`📩 [DEBUG] Pesan masuk dari ${remoteJid}: "${text}"`);
 
     // Jika ini di dalam grup, bot HANYA merespons jika di-tag atau dipanggil
     if (isGroup) {
@@ -141,9 +144,15 @@ async function startBot() {
       if (!isMentioned && !isTriggeredText) {
         return; // Abaikan chat grup biasa
       }
+    } else {
+      // Jika ini di chat pribadi, tapi pesannya DARI nomor bot sendiri (fromMe)
+      // Abaikan KECUALI dia sengaja memanggil dengan trigger
+      if (isFromMe) {
+        const textLower = text.toLowerCase();
+        const isTriggeredText = textLower.startsWith('!ai') || textLower.includes('@groq') || textLower.startsWith('groq');
+        if (!isTriggeredText) return;
+      }
     }
-
-    console.log(`📩 Pesan dari ${remoteJid}: ${text}`);
 
     try {
       await sock.sendPresenceUpdate('composing', remoteJid);
