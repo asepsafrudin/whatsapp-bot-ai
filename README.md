@@ -106,10 +106,15 @@ Salin template dan isi variabel yang relevan. **Untuk produksi, edit
 
 ```bash
 cp .env.example .env
-# edit .env — minimal yang WAJIB diisi:
-#   OPENAI_API_KEY / GROQ_API_KEY  → untuk ai-orchestrator
-#   WEBHOOK_SECRET                → shared secret dengan orchestrator
-#   POSTGRES_HOST/PORT/DB/USER/PASSWORD
+# edit .env — minimal yang WAJIB diisi di sisi BOT ini:
+#   WEBHOOK_SECRET         → shared secret dengan ai-orchestrator
+#   POSTGRES_HOST/PORT/DB/USER/PASSWORD  → koneksi DB untuk memory layer
+#   BRIEFING_GROUP_JID     → JID grup untuk briefing pagi (jika dipakai)
+#
+# CATATAN: OPENAI_API_KEY / GROQ_API_KEY di .env.example adalah LEGACY.
+# Bot ini TIDAK memanggil LLM langsung — semua lewat FASTAPI_URL ke
+# ai-orchestrator. API key LLM harus diset di .env milik ai-orchestrator
+# (bukan di file ini). Lihat services/ai-orchestrator/.
 ```
 
 ### 3. Setup database (sekali)
