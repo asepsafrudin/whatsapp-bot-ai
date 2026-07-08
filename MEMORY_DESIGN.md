@@ -1,7 +1,7 @@
 # Memory Design — `services/whatsapp-bot-ai/`
 
-> **Task:** TASK-047 (1a) + TASK-048 (1b) + TASK-049 (1c) + TASK-050 (1d) + **TASK-053 (1e)**
-> **Status:** 🟢 COMPLETED (Fase 1a + 1b + 1c + 1d + **1e**)
+> **Task:** TASK-047 (1a) + TASK-048 (1b) + TASK-049 (1c) + TASK-050 (1d) + **TASK-053 (1e)** + **TASK-054 (5)**
+> **Status:** 🟢 COMPLETED (Fase 1a + 1b + 1c + 1d + 1e + **5**)
 > **Referensi utama:** [`docs/09-proposals/Diagram_Memori_AI_Agent_Revisi.md`](../../docs/09-proposals/Diagram_Memori_AI_Agent_Revisi.md)
 
 ## 1. Tujuan
@@ -427,7 +427,109 @@ Logic ini mencegah kontak Google (yang punya segment kaya) ditimpa oleh nama pus
 - `services/whatsapp-bot-ai/MEMORY_DESIGN.md` — section 6.7 (Fase 1e) (TASK-053-F)
 - `services/ai-orchestrator/contacts_sync_v2.py` — schema upsert (TASK-052, sudah ada)
 
-## 7. Limitasi Fase 1a + 1b + 1c + 1d + 1e (Sengaja Ditunda)
+## 6.8. Explicit & Profile Memory (Fase 5 — TASK-054)
+
+Per 2026-07-08, **`!ingat` / `!lupa` / `!profile` / `!memory` commands** aktif. User bisa menyimpan fakta & preferensi yang persistent (tidak expire) ke DB, dan bot akan menjawab tanpa lewat LLM.
+
+### 6.8.1. Perbedaan dengan `recent` memory
+
+| Aspek | `recent` | `explicit` / `profile` |
+|---|---|---|
+| **Expire** | Ya (30 hari, auto-purge) | **Tidak** (durable) |
+| **Trigger** | Otomatis dari semua chat | Manual via command `!ingat` |
+| **Use case** | Konteks percakapan | Fakta, preferensi, catatan |
+| **Lookup key** | `created_at` ORDER BY DESC | `metadata->>'key'` |
+| **Versioning** | Single version | Auto-increment saat update |
+| **Versi Fase** | 1a-1d | 5 (TASK-054) |
+
+### 6.8.2. Commands
+
+| Command | Format | Fungsi | Memory Type |
+|---|---|---|---|
+| `!ingat` | `!ingat <key>: <value>` | Simpan fakta | `explicit` |
+| `!remember` | `!remember <key>: <value>` | Alias `!ingat` (English) | `explicit` |
+| `!lupa` | `!lupa <key>` | Hapus fakta | `explicit` |
+| `!forget` | `!forget <key>` | Alias `!lupa` (English) | `explicit` |
+| `!profile` | `!profile <key> <value>` | Simpan preferensi | `profile` |
+| `!memory` | (no arg) | List semua explicit memory | — |
+
+Contoh:
+- `!ingat nama_panggilan: Budi`
+- `!profile minuman_favorit Kopi hitam`
+- `!lupa nama_panggilan`
+- `!memory` → list 5 item
+
+### 6.8.3. Alur (Short-Circuit Pattern)
+
+```
+User: "Bot, !ingat nama_panggilan: Budi"
+        ↓
+Baileys event messages.upsert
+        ↓
+memoryRouter.selectMemoryStores({text: "!ingat ..."})
+        ↓ command = {type: 'save_explicit', memoryType: 'explicit'}
+[SHORT-CIRCUIT] Jangan forward ke orchestrator.
+        ↓
+handleMemoryCommand(routerResult, text)
+        ↓ parseKeyValue → {key: 'nama_panggilan', value: 'Budi'}
+        ↓
+memoryStore.saveExplicitMemory('personal', jid, key, value, {memoryType: 'explicit'})
+        ↓ INSERT ON CONFLICT (key exists) DO UPDATE SET version = version + 1
+        ↓
+Bot reply: "✅ Tersimpan! explicit memory nama_panggilan (v1) — baru."
+```
+
+### 6.8.4. Skema & Index (TASK-054)
+
+- Tabel `whatsapp_bot.memories` sudah punya `memory_type='explicit'` dan `'profile'` (Fase 1a CHECK constraint).
+- **Key disimpan di `metadata->>'key'`** (JSONB) — bukan kolom terpisah (flexible).
+- **Index baru** (TASK-054):
+  - `idx_memories_explicit_profile_key` — `(scope_type, scope_id, metadata->>'key')` WHERE memory_type IN ('explicit', 'profile')
+  - `idx_memories_explicit_profile_listing` — `(scope_type, scope_id, memory_type, updated_at DESC)` WHERE memory_type IN ('explicit', 'profile')
+- **CHECK constraint** (TASK-054):
+  - `chk_explicit_profile_no_expiry` — explicit & profile TIDAK boleh punya `expires_at` (data durable).
+- Migration: `memory/migration_054_explicit_profile.sql`.
+
+### 6.8.5. API Store (TASK-054)
+
+```js
+// Simpan (insert atau update dengan version++)
+const result = await memoryStore.saveExplicitMemory(
+  'personal', '628xxx@s.whatsapp.net',
+  'nama_panggilan', 'Budi',
+  { memoryType: 'explicit' }
+);
+// → { id: 123, is_insert: true, version: 1 }
+
+// Ambil by key
+const mem = await memoryStore.getExplicitMemory(
+  'personal', '628xxx@s.whatsapp.net', 'nama_panggilan'
+);
+
+// List semua
+const items = await memoryStore.listExplicitMemory('personal', '628xxx@s.whatsapp.net');
+// → [{ key: 'nama_panggilan', content: 'Budi', version: 1, updated_at: ... }]
+
+// Hapus
+await memoryStore.deleteExplicitMemory('personal', '628xxx@s.whatsapp.net', 'nama_panggilan');
+```
+
+### 6.8.6. Limitasi Fase 5 (Sengaja)
+
+- ⏳ Tidak ada auto-suggest: user harus manual `!ingat` (Fase 3 — implicit memory akan extract dari chat).
+- ⏳ Tidak ada `!profile` listing command (cuma `!memory`). Tambah nanti jika perlu.
+- ⏳ Hanya personal chat yang proses command (group chat skip). Group admin self-test bisa pakai `fromMe=true` di personal.
+- ⏳ Tidak ada encryption at-rest untuk `content` (plaintext di DB). Jika perlu GDPR-grade, tambah encryption di Fase 6.
+
+### 6.8.7. File yang Diubah (Fase 5 — TASK-054)
+
+- `services/whatsapp-bot-ai/memory/store.js` — `saveExplicitMemory()`, `getExplicitMemory()`, `listExplicitMemory()`, `deleteExplicitMemory()`
+- `services/whatsapp-bot-ai/memory/router.js` — command detection (`!ingat` / `!lupa` / `!profile` / `!memory`)
+- `services/whatsapp-bot-ai/memory/migration_054_explicit_profile.sql` — indexes + CHECK constraint
+- `services/whatsapp-bot-ai/index.js` — `parseKeyValue()`, `handleMemoryCommand()`, short-circuit dispatch di `messages.upsert`
+- `services/whatsapp-bot-ai/MEMORY_DESIGN.md` — section 6.8 (Fase 5)
+
+## 7. Limitasi Fase 1a + 1b + 1c + 1d + 1e + 5 (Sengaja Ditunda)
 
 - ❌ **Profile, Explicit, Durable, Implicit memory belum ada** — hanya `recent` yang aktif.
 - ❌ **Belum ada semantic search** — pakai `tsvector` atau `pgvector` di fase 2.
@@ -443,6 +545,7 @@ Logic ini mencegah kontak Google (yang punya segment kaya) ditimpa oleh nama pus
 | **1c** | Schema hardening: dedup (`external_message_id`), CHECK constraint, `scope_id`→128, content truncation | ✅ COMPLETED |
 | **1d** | Emoji-safe truncation + requestId round-trip (assistant idempotency) + fire-and-forget saveMessage | ✅ COMPLETED |
 | **1e** | DB-first contacts: `public.member_profiles` sebagai SoT, `rbac.py` load dari DB, `index.js` real-time upsert, agent tool `sync_contacts` | ✅ COMPLETED (TASK-053) |
+| **5** | Explicit memory (`!ingat key: value` / `!lupa` / `!profile` / `!memory`) + durable storage + indexes | ✅ COMPLETED (TASK-054) |
 | **2** | Endpoint `/api/v1/memory/extract` di ai-orchestrator; ConsolidationJob (similarity check, merge, versioning) | ⏳ BACKLOG |
 | **3** | Implicit memory (async batch cron) — pola interaksi, jam aktif, topik populer | ⏳ BACKLOG |
 | **4** | Durable memory + semantic search (pgvector) + integrasi knowledge base PUU | ⏳ BACKLOG |

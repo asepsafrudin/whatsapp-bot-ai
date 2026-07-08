@@ -58,16 +58,30 @@ function selectMemoryStores(ctx) {
   const { scope_type, scope_id } = resolveScope(remoteJid, isGroup);
 
   // Fase 1b: baik personal maupun group, recent memory AKTIF.
-  // (Fase 2+ akan tambah: profile, explicit jika "ingat", durable jika keyword)
-  const lower = (text || '').toLowerCase();
+  // TASK-054 (Fase 5): tambah explicit & profile memory detection.
+  const lower = (text || '').toLowerCase().trim();
   const memory_types = ['recent'];
+  let command = null;  // TASK-054: command intent (untuk handler di index.js)
 
-  // Hint untuk fase berikutnya (saat ini hanya dicatat di metadata, belum di-eksekusi)
-  if (lower.includes('ingat') || lower.startsWith('!remember')) {
-    memory_types.push('explicit'); // planned Fase 2
-  }
-  if (lower.startsWith('!profile') || lower.includes('preferensi saya')) {
-    memory_types.push('profile'); // planned Fase 2
+  // === TASK-054: Command detection ===
+  // !ingat <key>: <value>  → explicit memory (durable, per-user)
+  // !lupa <key>           → hapus explicit memory
+  // !profile <key> <value> → profile memory (preferences, durable)
+  // !memory               → list semua explicit memory user
+  if (lower.startsWith('!ingat ') || lower.startsWith('!remember ')) {
+    memory_types.push('explicit');
+    command = { type: 'save_explicit', memoryType: 'explicit' };
+  } else if (lower.startsWith('!lupa ') || lower.startsWith('!forget ')) {
+    command = { type: 'delete_explicit', memoryType: 'explicit' };
+  } else if (lower.startsWith('!profile ')) {
+    memory_types.push('profile');
+    command = { type: 'save_explicit', memoryType: 'profile' };
+  } else if (lower === '!memory' || lower === '!ingat' || lower === '!profile') {
+    command = { type: 'list_explicit', memoryType: 'explicit' };
+  } else if (lower.includes('ingat') || lower.includes('preferensi saya')) {
+    // Hint natural language (untuk LLM context, bukan command langsung)
+    memory_types.push('explicit');
+    memory_types.push('profile');
   }
 
   return {
@@ -75,6 +89,7 @@ function selectMemoryStores(ctx) {
     scope_type,
     scope_id,
     memory_types,
+    command,  // TASK-054: null jika bukan command, atau {type, memoryType}
     reason: isGroup
       ? 'Fase 1b: group chat → recent memory only.'
       : 'Fase 1b: personal chat → recent memory only.',

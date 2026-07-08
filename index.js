@@ -197,6 +197,94 @@ app.listen(WEBHOOK_PORT, () => {
   console.log(`🚀 Webhook Server berjalan di port ${WEBHOOK_PORT}`);
 });
 
+// =============================================================================
+// TASK-054 (Fase 5): Handler command `!ingat` / `!lupa` / `!profile` / `!memory`
+// =============================================================================
+// Command synchronous (tidak lewat orchestrator/LLM) — langsung query DB.
+// Format:
+//   !ingat <key>: <value>   → simpan explicit memory
+//   !lupa <key>             → hapus explicit memory
+//   !profile <key> <value>  → simpan profile memory (preferences)
+//   !memory                 → list semua explicit memory
+// =============================================================================
+function parseKeyValue(rawText, prefix) {
+  // Returns { key, value, error }
+  const stripped = rawText.trim().slice(prefix.length).trim();
+  // Support !ingat <key>: <value> (with colon) and !profile <key> <value> (space)
+  if (prefix.startsWith('!ingat') || prefix.startsWith('!remember')) {
+    const colonIdx = stripped.indexOf(':');
+    if (colonIdx < 0) {
+      return { error: `Format salah. Gunakan: ${prefix} <key>: <value>` };
+    }
+    const key = stripped.slice(0, colonIdx).trim();
+    const value = stripped.slice(colonIdx + 1).trim();
+    if (!key || !value) {
+      return { error: `Key dan value tidak boleh kosong.` };
+    }
+    return { key, value };
+  } else if (prefix.startsWith('!profile')) {
+    // !profile <key> <value>  (value boleh multi-word tanpa kutip)
+    const spaceIdx = stripped.indexOf(' ');
+    if (spaceIdx < 0) {
+      return { error: `Format salah. Gunakan: !profile <key> <value>` };
+    }
+    const key = stripped.slice(0, spaceIdx).trim();
+    const value = stripped.slice(spaceIdx + 1).trim();
+    if (!key || !value) {
+      return { error: `Key dan value tidak boleh kosong.` };
+    }
+    return { key, value };
+  } else if (prefix.startsWith('!lupa') || prefix.startsWith('!forget')) {
+    return { key: stripped.trim(), value: null };
+  }
+  return { error: 'Prefix tidak dikenal.' };
+}
+
+async function handleMemoryCommand(routerResult, rawText) {
+  if (!routerResult.command) return null;
+  const { type, memoryType } = routerResult.command;
+  const { scope_type, scope_id } = routerResult;
+
+  try {
+    if (type === 'save_explicit') {
+      const prefix = rawText.toLowerCase().startsWith('!remember') ? '!remember'
+        : rawText.toLowerCase().startsWith('!profile') ? '!profile'
+        : '!ingat';
+      const parsed = parseKeyValue(rawText, prefix);
+      if (parsed.error) return parsed.error;
+      const result = await memoryStore.saveExplicitMemory(
+        scope_type, scope_id, parsed.key, parsed.value, { memoryType }
+      );
+      return `✅ Tersimpan! ${memoryType} memory *${parsed.key}* (v${result.version})${result.is_insert ? ' — baru' : ' — update'}.`;
+    }
+
+    if (type === 'delete_explicit') {
+      const parsed = parseKeyValue(rawText, '!lupa');
+      if (parsed.error || !parsed.key) return `Format: !lupa <key>`;
+      const result = await memoryStore.deleteExplicitMemory(
+        scope_type, scope_id, parsed.key, memoryType
+      );
+      if (result.deleted_count === 0) {
+        return `ℹ️ Key *${parsed.key}* tidak ditemukan.`;
+      }
+      return `🗑️ Dihapus: *${parsed.key}* (${result.deleted_count} row).`;
+    }
+
+    if (type === 'list_explicit') {
+      const items = await memoryStore.listExplicitMemory(scope_type, scope_id, memoryType);
+      if (items.length === 0) {
+        return `📭 Belum ada ${memoryType} memory. Coba: \`!ingat nama: Budi\``;
+      }
+      const lines = items.map((it, i) => `${i + 1}. *${it.key}* = ${it.content} _(v${it.version})_`);
+      return `🧠 *${memoryType.toUpperCase()} Memory* (${items.length}):\n${lines.join('\n')}`;
+    }
+    return null;
+  } catch (err) {
+    console.error(`[Memory Command] Error:`, err.message);
+    return `❌ Gagal: ${err.message}`;
+  }
+}
+
 // Inisialisasi Baileys WhatsApp Bot
 async function startBot() {
   const { state, saveCreds } = await useMultiFileAuthState('auth_info');
@@ -309,6 +397,29 @@ async function startBot() {
       isGroup,
       text,
     });
+
+    // ========== TASK-054 (Fase 5): Short-circuit command handler ==========
+    // Jika pesan adalah command `!ingat` / `!lupa` / `!profile` / `!memory`,
+    // tangani langsung di sini (sync, tidak ke orchestrator).
+    if (routerResult.command) {
+      // Hanya proses di personal chat atau jika fromMe (admin self-test)
+      if (!isGroup || isFromMe) {
+        try {
+          const reply = await handleMemoryCommand(routerResult, text);
+          if (reply) {
+            await sock.sendMessage(remoteJid, { text: reply }, { quoted: msg });
+            console.log(`[Memory Command] ✅ Replied to ${remoteJid}: ${reply.split('\n')[0]}`);
+            return;  // jangan forward ke orchestrator
+          }
+        } catch (cmdErr) {
+          console.error('[Memory Command] Gagal:', cmdErr.message);
+          await sock.sendMessage(remoteJid, {
+            text: `❌ Error: ${cmdErr.message}`,
+          }, { quoted: msg });
+          return;
+        }
+      }
+    }
 
     if (routerResult.active) {
       // TASK-050 Fase 1d: Fire-and-forget save user message (non-blocking)
