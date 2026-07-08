@@ -78,11 +78,11 @@ async function run() {
 
   if (hasVector) {
     // Insert 2 row durable: satu "alive", satu soft-deleted
-    await store.saveDurableMemory('user', SCOPE, 'User suka nasi goreng', {
+    await store.saveDurableMemory('personal', SCOPE, 'User suka nasi goreng', {
       embedding: new Array(384).fill(0).map((_, i) => Math.sin(i)),
-      source: 'e2e_test',
+      source: 'inferred',
     });
-    const all = await store.listDurableMemory('user', SCOPE);
+    const all = await store.listDurableMemory('personal', SCOPE);
     assert(all.length === 1, `listDurableMemory returns ${all.length === 1 ? 1 : all.length} alive row`);
     const aliveId = all[0].id;
 
@@ -91,14 +91,58 @@ async function run() {
       `UPDATE whatsapp_bot.memories SET expires_at = NOW() WHERE id = $1`,
       [aliveId]
     );
-    const after = await store.listDurableMemory('user', SCOPE);
+    const after = await store.listDurableMemory('personal', SCOPE);
     assert(after.length === 0, 'listDurableMemory excludes soft-deleted row');
     const found = await store.getDurableMemory(aliveId);
     assert(found === null, 'getDurableMemory returns null for soft-deleted row');
-    const similar = await store.findSimilarDurable('user', SCOPE, new Array(384).fill(0).map((_, i) => Math.sin(i)), 5, 0.5);
+    const similar = await store.findSimilarDurable('personal', SCOPE, new Array(384).fill(0).map((_, i) => Math.sin(i)), 5, 0.5);
     assert(similar.length === 0, 'findSimilarDurable excludes soft-deleted row');
   } else {
     console.log('  ⏭️  skip (pgvector OFF, requires embedding column)');
+  }
+
+  // ---- TEST 5: ConsolidationJob end-to-end ----
+  console.log('\nTest 5: ConsolidationJob merges similar rows');
+  if (hasVector) {
+    const MERGE_SCOPE = `e2e_merge_${Date.now()}`;
+    // Bersihkan
+    await client.query(`DELETE FROM whatsapp_bot.memories WHERE scope_id=$1`, [MERGE_SCOPE]);
+
+    // Buat base vector acuan + 2 row dengan embedding SANGAT mirip (cosine ~1)
+    const base = new Array(384).fill(0).map((_, i) => Math.sin(i * 0.1));
+    const similar1 = base.map((v) => v + (Math.random() - 0.5) * 0.001);  // perturbasi kecil
+    const similar2 = base.map((v) => v + (Math.random() - 0.5) * 0.001);
+    const different = new Array(384).fill(0).map((_, i) => Math.cos(i * 0.1));  // beda jauh
+
+    const id1 = (await store.saveDurableMemory('personal', MERGE_SCOPE, 'Fact 1: user works at PUU', { embedding: base, source: 'inferred' })).id;
+    const id2 = (await store.saveDurableMemory('personal', MERGE_SCOPE, 'Fact 2: user is in PUU', { embedding: similar1, source: 'inferred' })).id;
+    const id3 = (await store.saveDurableMemory('personal', MERGE_SCOPE, 'Fact 3: user likes nasi goreng', { embedding: different, source: 'inferred' })).id;
+
+    console.log(`  ℹ️  inserted 3 candidates: ids=[${id1}, ${id2}, ${id3}]`);
+
+    // Jalankan ConsolidationJob
+    const stats = await store.runConsolidationJob({
+      batchSize: 10,
+      similarityThreshold: 0.85,
+      scopeType: 'personal',
+    });
+    console.log(`  ℹ️  ConsolidationJob stats: ${JSON.stringify(stats)}`);
+
+    assert(stats.scanned >= 1, `scanned >= 1 (got ${stats.scanned})`);
+    assert(stats.errors === 0, `errors === 0 (got ${stats.errors})`);
+
+    // Verifikasi: minimal 1 row di-merge (yang mirip digabung)
+    const survivors = await store.listDurableMemory('personal', MERGE_SCOPE);
+    assert(survivors.length <= 2, `after merge: <= 2 survivors (got ${survivors.length})`);
+
+    // Verifikasi: row yang berbeda (Fact 3) masih ada (tidak ikut di-merge)
+    const fact3 = await store.getDurableMemory(id3);
+    assert(fact3 !== null, 'different row (Fact 3) still exists after ConsolidationJob');
+
+    // Cleanup
+    await client.query(`DELETE FROM whatsapp_bot.memories WHERE scope_id=$1`, [MERGE_SCOPE]);
+  } else {
+    console.log('  ⏭️  skip (pgvector OFF)');
   }
 
   // ---- Cleanup ----
