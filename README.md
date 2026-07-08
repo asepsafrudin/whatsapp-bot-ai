@@ -216,7 +216,7 @@ Detail lengkap di [`MEMORY_DESIGN.md`](./MEMORY_DESIGN.md). Ringkasan:
 | `recent` | Otomatis setiap chat | 30 hari | Konteks percakapan (10 turn terakhir) |
 | `explicit` | `!ingat key: value` | **Tidak** | Fakta yang user ingin disimpan persistent |
 | `profile` | `!profile key value` | **Tidak** | Preferensi user (minuman, format, dll) |
-| `durable` | (Fase 2) | Tidak | Semantic search via pgvector |
+| `durable` | (Fase 2 — TASK-055) | Tidak | Semantic search via pgvector + auto-merge ConsolidationJob |
 | `implicit` | (Fase 3) | Tidak | Pola interaksi hasil ekstraksi otomatis |
 
 ### Commands (Fase 5 — TASK-054)
@@ -320,7 +320,7 @@ orchestrator untuk konfigurasi Groq / OpenAI / model lain.
 | 1d | ✅ | Emoji-safe truncation + requestId round-trip + fire-and-forget |
 | 1e | ✅ | DB-first contacts (`member_profiles`) + `sync_contacts` tool |
 | 5  | ✅ | Commands `!ingat` / `!lupa` / `!profile` / `!memory` |
-| 2  | ⏳ | Consolidation job + `/api/v1/memory/extract` |
+| 2  | ✅ | **Durable memory** + **ConsolidationJob** + `/api/v1/memory/extract` + `pgvector` semantic search |
 | 3  | ⏳ | Implicit memory (async batch) |
 | 4  | ⏳ | Durable memory + semantic search (pgvector) |
 | 6  | ⏳ | Admin UI / CLI untuk lihat, hapus, export memory |

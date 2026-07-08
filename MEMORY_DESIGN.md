@@ -1,7 +1,7 @@
 # Memory Design — `services/whatsapp-bot-ai/`
 
-> **Task:** TASK-047 (1a) + TASK-048 (1b) + TASK-049 (1c) + TASK-050 (1d) + **TASK-053 (1e)** + **TASK-054 (5)**
-> **Status:** 🟢 COMPLETED (Fase 1a + 1b + 1c + 1d + 1e + **5**)
+> **Task:** TASK-047 (1a) + TASK-048 (1b) + TASK-049 (1c) + TASK-050 (1d) + **TASK-053 (1e)** + **TASK-054 (5)** + **TASK-055 (2)**
+> **Status:** 🟢 COMPLETED (Fase 1a + 1b + 1c + 1d + 1e + **2** + **5**)
 > **Referensi utama:** [`docs/09-proposals/Diagram_Memori_AI_Agent_Revisi.md`](../../docs/09-proposals/Diagram_Memori_AI_Agent_Revisi.md)
 
 ## 1. Tujuan
@@ -529,6 +529,170 @@ await memoryStore.deleteExplicitMemory('personal', '628xxx@s.whatsapp.net', 'nam
 - `services/whatsapp-bot-ai/index.js` — `parseKeyValue()`, `handleMemoryCommand()`, short-circuit dispatch di `messages.upsert`
 - `services/whatsapp-bot-ai/MEMORY_DESIGN.md` — section 6.8 (Fase 5)
 
+## 6.9. Durable Memory & ConsolidationJob (Fase 2 — TASK-055)
+
+Per 2026-07-08, **Durable memory** + **ConsolidationJob** aktif. Bot bisa menyimpan fakta jangka panjang (hasil extract LLM dari chat) dan secara otomatis merge fakta yang mirip (semantik).
+
+### 6.9.1. Perbedaan Durable vs Recent/Explicit
+
+| Aspek | `recent` | `explicit` | `durable` (Baru) |
+|---|---|---|---|
+| **Expire** | Ya (30 hari) | Tidak | **Tidak** |
+| **Trigger** | Otomatis chat | Manual `!ingat` | **Ekstrak LLM** dari chat |
+| **Lookup** | `created_at` ORDER BY | `metadata->>'key'` | **Cosine similarity** (pgvector) |
+| **Versioning** | Single | Auto-increment | Auto-increment + **merge history** (`source_memory_ids`) |
+| **Embedding** | Tidak ada | Tidak ada | **WAJIB** (vector(384)) |
+
+### 6.9.2. Skema Database (TASK-055)
+
+Kolom baru di `whatsapp_bot.memories`:
+
+| Kolom | Tipe | Keterangan |
+|---|---|---|
+| `embedding` | `vector(384)` | nomic-embed-text via Ollama. NULL OK untuk `recent`/`explicit`. WAJIB untuk `durable`. |
+| `consolidated_at` | TIMESTAMPTZ | Audit trail: kapan terakhir di-process ConsolidationJob. NULL = belum pernah. |
+| `source_memory_ids` | BIGINT[] | ID row asal yang sudah di-merge jadi row ini. Untuk trace history. |
+
+Index baru:
+- `idx_memories_embedding_ivfflat` — ivfflat(cosine, lists=100) WHERE memory_type='durable'
+- `idx_memories_durable_scope_v2` — composite (scope_type, scope_id, memory_type, updated_at DESC) WHERE memory_type='durable'
+- `idx_memories_durable_pending` — (created_at ASC) WHERE memory_type='durable' AND consolidated_at IS NULL
+
+View baru: `whatsapp_bot.v_durable_memories` — query ringan + has_embedding flag.
+
+### 6.9.3. Store API (TASK-055)
+
+```js
+// Simpan durable memory (WAJIB isi embedding 384-dim)
+const result = await memoryStore.saveDurableMemory(
+  'personal', '628xxx@s.whatsapp.net',
+  'User tinggal di Bandung, Jawa Barat.',
+  {
+    embedding: [0.12, 0.34, ...], // 384 floats
+    sourceMemoryIds: [123, 456],  // row yang di-merge (optional)
+    metadata: { category: 'personal_identity', extraction_confidence: 0.85 }
+  }
+);
+// → { id, is_insert: true, has_embedding: true, embedding_dim: 384 }
+
+// Cari top-K mirip (cosine similarity)
+const sims = await memoryStore.findSimilarDurable(
+  'personal', '628xxx@s.whatsapp.net', queryEmbedding, 5, 0.7
+);
+// → [{ id, content, similarity, ... }]
+
+// Merge N row jadi 1 (winner = rows[0])
+const merged = await memoryStore.mergeDurableMemories([101, 102, 103], { mergeStrategy: 'append' });
+// → { winner_id: 101, merged_count: 3, new_version: 2 }
+
+// ConsolidationJob (cron harian, idempotent)
+const stats = await memoryStore.runConsolidationJob({ batchSize: 50, similarityThreshold: 0.85 });
+// → { scanned: 50, merged: 8, errors: 0, duration_ms: 1234 }
+```
+
+### 6.9.4. Alur End-to-End (Fase 2)
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│ WhatsApp (Baileys)                                                    │
+└─────────────────┬────────────────────────────────────────────────────┘
+                  │ messages.upsert (user text)
+                  ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ whatsapp-bot-ai (Node.js)                                             │
+│  1. memoryRouter.selectMemoryStores                                   │
+│  2. saveMessage(recent) — seperti biasa (Fase 1a)                     │
+│  3. axios POST /api/v1/chat { history }                                │
+│                                                                       │
+│  -- TRIGGER MEMORY EXTRACT (after chat selesai / cron) --             │
+│  4. axios POST /api/v1/memory/extract { scope, history }              │
+└─────────────────┬───────────────────────────────────────────────────┘
+                  │
+                  ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ ai-orchestrator (FastAPI)                                             │
+│  POST /api/v1/memory/extract                                          │
+│   ├─ memory_extract.extract_facts_from_history(history)               │
+│   │   └─ LLM (Groq llama-3.3-70b) → [{content, confidence, ...}]      │
+│   ├─ For each fact:                                                   │
+│   │   ├─ memory_extract.generate_embedding_for_text(content)          │
+│   │   │   └─ Ollama nomic-embed-text → vector(384)                    │
+│   │   └─ POST bot:3001/memory/save_durable { ... }                    │
+│   └─ Return: { extracted_count, saved_count, facts }                  │
+└─────────────────┬───────────────────────────────────────────────────┘
+                  │
+                  ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ bot: POST /memory/save_durable                                        │
+│   └─ memoryStore.saveDurableMemory(scope, id, content, {embedding})   │
+│       └─ INSERT INTO whatsapp_bot.memories (... embedding::vector)    │
+└─────────────────┬───────────────────────────────────────────────────┘
+                  │
+                  ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ PostgreSQL: whatsapp_bot.memories                                     │
+│   - Row baru: memory_type='durable', embedding=[...],                  │
+│     consolidated_at=NULL, source_memory_ids=NULL                      │
+└─────────────────────────────────────────────────────────────────────┘
+                  │
+                  │ -- ConsolidationJob (cron 04:00 WIB) --
+                  ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ whatsapp-bot-ai (cron ConsolidationJob)                                │
+│  1. SELECT row durable WHERE consolidated_at IS NULL                  │
+│  2. For each row:                                                      │
+│     a. findSimilarDurable(embedding, threshold=0.85)                   │
+│     b. Jika ada >= 2 mirip → mergeDurableMemories                     │
+│     c. Mark winner consolidated                                        │
+│  3. Return stats: {scanned, merged, errors, duration}                 │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 6.9.5. Endpoint Baru
+
+| Service | Endpoint | Method | Fungsi |
+|---|---|---|---|
+| whatsapp-bot-ai | `/memory/save_durable` | POST | Simpan durable memory + embedding (dipanggil orchestrator) |
+| ai-orchestrator | `/api/v1/memory/extract` | POST | Extract durable facts via LLM dari history |
+
+Auth: sama seperti endpoint lain — `X-Webhook-Secret` header.
+
+### 6.9.6. Environment Variable Baru
+
+```bash
+# .env (bot side)
+WHATSAPP_MEMORY_CONSOLIDATION_CRON=0 4 * * *      # default 04:00 WIB harian
+WHATSAPP_MEMORY_CONSOLIDATION_BATCH=50             # max row per run
+WHATSAPP_MEMORY_CONSOLIDATION_SIMILARITY=0.85       # cosine threshold
+
+# .env (orchestrator side)
+OLLAMA_URL=http://localhost:11434                   # Ollama server
+EMBEDDING_MODEL=nomic-embed-text                    # 384-dim
+GROQ_API_KEY=gsk_xxx                                # untuk extract_facts
+WHATSAPP_BOT_URL=http://localhost:3001               # callback ke bot
+```
+
+### 6.9.7. Limitasi Fase 2 (Sengaja)
+
+- ⏳ **pgvector optional** — jika extension tidak tersedia, `embedding` column di-skip dan `findSimilarDurable` fallback ke ILIKE (text-based).
+- ⏳ **Merge strategy hanya 'append'** — `'longest'` dan `'replace_winner'` reserved untuk Fase 4.
+- ⏳ **Soft-delete losers** — row di-merge di-soft-delete (set `expires_at = NOW()`), bukan hard-delete. Untuk audit.
+- ⏳ **Tidak ada undo** — Fase 4 akan tambah `source_memory_ids` reversal.
+- ⏳ **LLM extract bisa halusinasi** — min_confidence=0.6 default, naikkan ke 0.8 jika terlalu noisy.
+- ⏳ **Embedding via Ollama harus running** — jika down, fallback ke hash-based pseudo-embedding (deterministic, tidak semantically meaningful tapi cukup untuk exact-match dedup).
+
+### 6.9.8. File yang Diubah (Fase 2 — TASK-055)
+
+- `services/whatsapp-bot-ai/memory/migration_055_fase2_consolidation.sql` (BARU) — schema: embedding, consolidated_at, source_memory_ids + 3 index + 1 view
+- `services/whatsapp-bot-ai/memory/store.js` (+ 7 API functions: `saveDurableMemory`, `getDurableMemory`, `listDurableMemory`, `findSimilarDurable`, `mergeDurableMemories`, `markConsolidated`, `runConsolidationJob`)
+- `services/whatsapp-bot-ai/index.js` (+ `/memory/save_durable` endpoint + `cron.schedule(0 4 * * *)` untuk ConsolidationJob)
+- `services/ai-orchestrator/memory_extract.py` (BARU) — `extract_facts_from_history()` + `generate_embedding_for_text()` + fallback embedding
+- `services/ai-orchestrator/main.py` (+ `ExtractRequest` Pydantic model + `POST /api/v1/memory/extract` endpoint)
+- `services/ai-orchestrator/mcp_tools.py` (+ `@tool extract_durable_memory` + `@tool list_durable_memory` untuk superadmin via chat)
+- `services/ai-orchestrator/graph.py` (+ import + register 2 tools di superadmin tools list + contoh di system prompt)
+- `services/whatsapp-bot-ai/MEMORY_DESIGN.md` (section 6.9 + roadmap update)
+
+
 ## 7. Limitasi Fase 1a + 1b + 1c + 1d + 1e + 5 (Sengaja Ditunda)
 
 - ❌ **Profile, Explicit, Durable, Implicit memory belum ada** — hanya `recent` yang aktif.
@@ -546,7 +710,7 @@ await memoryStore.deleteExplicitMemory('personal', '628xxx@s.whatsapp.net', 'nam
 | **1d** | Emoji-safe truncation + requestId round-trip (assistant idempotency) + fire-and-forget saveMessage | ✅ COMPLETED |
 | **1e** | DB-first contacts: `public.member_profiles` sebagai SoT, `rbac.py` load dari DB, `index.js` real-time upsert, agent tool `sync_contacts` | ✅ COMPLETED (TASK-053) |
 | **5** | Explicit memory (`!ingat key: value` / `!lupa` / `!profile` / `!memory`) + durable storage + indexes | ✅ COMPLETED (TASK-054) |
-| **2** | Endpoint `/api/v1/memory/extract` di ai-orchestrator; ConsolidationJob (similarity check, merge, versioning) | ⏳ BACKLOG |
+| **2** | Endpoint `/api/v1/memory/extract` di ai-orchestrator; ConsolidationJob (similarity check, merge, versioning) | ✅ COMPLETED (TASK-055) |
 | **3** | Implicit memory (async batch cron) — pola interaksi, jam aktif, topik populer | ⏳ BACKLOG |
 | **4** | Durable memory + semantic search (pgvector) + integrasi knowledge base PUU | ⏳ BACKLOG |
 | **5** | Explicit memory (`!ingat ...`); Profile memory (preferensi user) | ⏳ BACKLOG |

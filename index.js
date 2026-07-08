@@ -114,6 +114,40 @@ app.get('/api/contacts', (req, res) => {
 });
 
 // Endpoint untuk menerima balasan dari FastAPI (LangGraph Orchestrator)
+// =============================================================================
+// TASK-055 (Fase 2): Endpoint /memory/save_durable — dipanggil orchestrator
+// setelah extract_facts_from_history() di /api/v1/memory/extract.
+// =============================================================================
+app.post('/memory/save_durable', async (req, res) => {
+  // Webhook secret check (shared dengan orchestrator)
+  const provided = req.headers['x-webhook-secret'] || req.headers['X-Webhook-Secret'];
+  if (provided !== process.env.WEBHOOK_SECRET && provided !== process.env.MCP_WEBHOOK_SECRET) {
+    return res.status(403).json({ error: 'Akses Ditolak: Webhook Secret Tidak Valid' });
+  }
+  const {
+    scope_type, scope_id, content, embedding,
+    source_memory_ids, metadata,
+  } = req.body || {};
+  if (!scope_type || !scope_id || !content || !embedding) {
+    return res.status(400).json({ error: 'scope_type, scope_id, content, embedding wajib diisi' });
+  }
+  try {
+    const result = await memoryStore.saveDurableMemory(scope_type, scope_id, content, {
+      embedding,
+      source: 'inferred',  // hasil extract LLM
+      role: 'system',
+      confidenceScore: (metadata && metadata.extraction_confidence) || 0.7,
+      metadata: metadata || {},
+      sourceMemoryIds: source_memory_ids || null,
+    });
+    console.log(`[Memory] 💎 Saved durable memory id=${result.id} for ${scope_type}:${scope_id}`);
+    return res.json({ status: 'ok', ...result });
+  } catch (e) {
+    console.error('[Memory] ❌ /memory/save_durable error:', e.message);
+    return res.status(500).json({ error: e.message });
+  }
+});
+
 app.post('/webhook/whatsapp', async (req, res) => {
   try {
     const webhookSecret = req.headers['x-webhook-secret'];
@@ -365,6 +399,22 @@ async function startBot() {
         console.log('[Memory] Trigger purge expired memories...');
         memoryStore.purgeExpired().catch(err =>
           console.error('[Memory] Purge job error:', err.message)
+        );
+      }, { timezone: 'Asia/Jakarta' });
+
+      // ===== TASK-055 (Fase 2): ConsolidationJob scheduler =====
+      // Setiap jam 04:00 WIB, jalankan runConsolidationJob() untuk scan
+      // durable memory yang belum di-consolidate, similarity check, dan merge.
+      const CONSOLIDATION_CRON = process.env.WHATSAPP_MEMORY_CONSOLIDATION_CRON || '0 4 * * *';
+      cron.schedule(CONSOLIDATION_CRON, () => {
+        console.log('[Memory] 🧠 Trigger ConsolidationJob (Fase 2)...');
+        memoryStore.runConsolidationJob({
+          batchSize: parseInt(process.env.WHATSAPP_MEMORY_CONSOLIDATION_BATCH || '50', 10),
+          similarityThreshold: parseFloat(process.env.WHATSAPP_MEMORY_CONSOLIDATION_SIMILARITY || '0.85'),
+        }).then((stats) => {
+          console.log(`[Memory] 🧠 ConsolidationJob selesai: ${JSON.stringify(stats)}`);
+        }).catch(err =>
+          console.error('[Memory] ConsolidationJob error:', err.message)
         );
       }, { timezone: 'Asia/Jakarta' });
     }
