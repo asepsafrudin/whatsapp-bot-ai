@@ -186,27 +186,73 @@ CREATE INDEX IF NOT EXISTS idx_memories_durable_pending
 -- -----------------------------------------------------------------------------
 -- 7. View: durable_memories (untuk query ringan + audit)
 -- -----------------------------------------------------------------------------
-CREATE OR REPLACE VIEW whatsapp_bot.v_durable_memories AS
-SELECT
-    id,
-    scope_type,
-    scope_id,
-    role,
-    content,
-    source,
-    confidence_score,
-    version,
-    metadata,
-    external_message_id,
-    embedding IS NOT NULL AS has_embedding,
-    consolidated_at,
-    source_memory_ids,
-    created_at,
-    updated_at
-FROM whatsapp_bot.memories
-WHERE memory_type = 'durable'
-  AND (expires_at IS NULL OR expires_at > NOW())
-ORDER BY scope_type, scope_id, created_at DESC;
+-- View ini harus aman dibuat di server TANPA pgvector (di mana kolom
+-- `embedding` tidak pernah dibuat). Jika pgvector aktif & kolom ada, view
+-- menyertakan `has_embedding`; jika tidak, kolom `has_embedding` di-hardcode
+-- ke FALSE agar view tetap bisa di-create.
+DO $$
+DECLARE
+    v_has_embedding BOOLEAN;
+BEGIN
+    SELECT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'whatsapp_bot'
+          AND table_name   = 'memories'
+          AND column_name  = 'embedding'
+    ) INTO v_has_embedding;
+
+    IF v_has_embedding THEN
+        EXECUTE $view$
+            CREATE OR REPLACE VIEW whatsapp_bot.v_durable_memories AS
+            SELECT
+                id,
+                scope_type,
+                scope_id,
+                role,
+                content,
+                source,
+                confidence_score,
+                version,
+                metadata,
+                external_message_id,
+                embedding IS NOT NULL AS has_embedding,
+                consolidated_at,
+                source_memory_ids,
+                created_at,
+                updated_at
+            FROM whatsapp_bot.memories
+            WHERE memory_type = 'durable'
+              AND (expires_at IS NULL OR expires_at > NOW())
+            ORDER BY scope_type, scope_id, created_at DESC
+        $view$;
+        RAISE NOTICE '✅ View v_durable_memories dibuat (dengan kolom has_embedding).';
+    ELSE
+        EXECUTE $view$
+            CREATE OR REPLACE VIEW whatsapp_bot.v_durable_memories AS
+            SELECT
+                id,
+                scope_type,
+                scope_id,
+                role,
+                content,
+                source,
+                confidence_score,
+                version,
+                metadata,
+                external_message_id,
+                FALSE AS has_embedding,
+                consolidated_at,
+                source_memory_ids,
+                created_at,
+                updated_at
+            FROM whatsapp_bot.memories
+            WHERE memory_type = 'durable'
+              AND (expires_at IS NULL OR expires_at > NOW())
+            ORDER BY scope_type, scope_id, created_at DESC
+        $view$;
+        RAISE NOTICE '⚠️ View v_durable_memories dibuat tanpa kolom has_embedding (pgvector off).';
+    END IF;
+END $$;
 
 -- -----------------------------------------------------------------------------
 -- 8. Verifikasi hasil migration

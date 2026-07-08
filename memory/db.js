@@ -13,7 +13,58 @@
 
 'use strict';
 
-const { Pool } = require('pg');
+const { Pool, types } = require('pg');
+
+// =============================================================================
+// TASK-055 Fase 2 (bugfix): Daftarkan type parser untuk tipe `vector` (pgvector)
+// =============================================================================
+// node-postgres secara default tidak mengenali tipe custom `vector` dari
+// pgvector. Hasilnya, nilai embedding dikembalikan sebagai string
+// "[0.12,0.34,...]" bukan array of float — yang akan memecah logika
+// yang mengandalkan `embedding.length`.
+//
+// Solusi: daftarkan type parser yang mem-parse string pgvector menjadi
+// array of float. OID tipe vector (biasanya 16385 atau 16386) di-resolve
+// lewat pg_type saat inisialisasi.
+//
+// Referensi: https://github.com/brianc/node-pg-types
+// =============================================================================
+const PGVECTOR_TYPE_PARSERS = new Map();
+
+function parsePgvectorToFloatArray(value) {
+  if (value == null) return null;
+  if (typeof value !== 'string') return value;  // sudah array atau bukan string
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  // Hapus bracket luar lalu split
+  const inner = trimmed.replace(/^\[/, '').replace(/\]$/, '');
+  return inner.split(',').map((s) => Number(s.trim()));
+}
+
+async function registerPgvectorTypeParser(client) {
+  try {
+    // Cari OID untuk tipe `vector` dan `vecf16` (jika ada)
+    const { rows } = await client.query(
+      `SELECT oid, typname FROM pg_type WHERE typname IN ('vector', '_vector')`
+    );
+    for (const r of rows) {
+      const oid = Number(r.oid);
+      if (!PGVECTOR_TYPE_PARSERS.has(oid)) {
+        types.setTypeParser(oid, parsePgvectorToFloatArray);
+        PGVECTOR_TYPE_PARSERS.set(oid, r.typname);
+      }
+    }
+    if (PGVECTOR_TYPE_PARSERS.size > 0) {
+      console.log(
+        `[memory/db] ✅ Registered pgvector type parser for OIDs: ` +
+        Array.from(PGVECTOR_TYPE_PARSERS.entries()).map(([o, n]) => `${n}=${o}`).join(', ')
+      );
+    }
+  } catch (e) {
+    // Tidak fatal — store.js sudah punya safety net via parseEmbedding()
+    console.warn('[memory/db] ⚠️ Gagal register pgvector type parser:', e.message);
+  }
+}
 
 // Tentukan connection string: prioritas DATABASE_URL, fallback ke POSTGRES_*
 const connectionString =
@@ -44,8 +95,11 @@ if (pool) {
   pool.on('error', (err) => {
     console.error('[memory/db] ❌ Unexpected error on idle PG client:', err.message);
   });
-  pool.on('connect', () => {
+  // Daftarkan type parser pgvector pada setiap koneksi baru (per-client, OID
+  // tidak shareable antar koneksi di pg < 8.x).
+  pool.on('connect', (client) => {
     console.log('[memory/db] ✅ New PG client connected to schema whatsapp_bot');
+    registerPgvectorTypeParser(client).catch(() => {});
   });
 }
 

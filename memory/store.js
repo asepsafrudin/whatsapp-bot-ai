@@ -37,6 +37,34 @@ const CONSOLIDATION_BATCH_SIZE = parseInt(
 const EMBEDDING_DIM = 384;  // nomic-embed-text output dim
 
 // =============================================================================
+// TASK-055 Fase 2 (bugfix): Cache flag hasVector di level modul
+// =============================================================================
+// `hasVector` dicek sekali saat startup (probe information_schema.columns).
+// Menghindari query tambahan setiap kali findSimilarDurable / saveDurableMemory
+// dipanggil. Jika migration berjalan setelah bot start, panggil
+// `await detectHasVector(true)` untuk refresh.
+// =============================================================================
+let _hasVectorCache = null;
+
+async function detectHasVector(force = false) {
+  if (_hasVectorCache !== null && !force) return _hasVectorCache;
+  try {
+    const probe = await db.query(
+      `SELECT 1 FROM information_schema.columns
+       WHERE table_schema='whatsapp_bot' AND table_name='memories' AND column_name='embedding' LIMIT 1`
+    );
+    _hasVectorCache = probe.rows.length > 0;
+  } catch (e) {
+    _hasVectorCache = false;
+  }
+  return _hasVectorCache;
+}
+
+function hasEmbeddingColumn() {
+  return _hasVectorCache === true;
+}
+
+// =============================================================================
 // Helper: code-point aware truncation (TASK-050 Fase 1d)
 // =============================================================================
 function truncateContent(content) {
@@ -278,10 +306,48 @@ async function deleteExplicitMemory(scopeType, scopeId, key, memoryType = 'expli
 // =============================================================================
 
 /**
+ * Parse raw embedding value yang datang dari DB.
+ * Mendukung:
+ *   - Array of float (jika type parser sudah didaftarkan di db.js)
+ *   - String dengan format "[0.12,0.34,...]" (default fallback node-postgres)
+ *   - null/undefined → return null
+ */
+function parseEmbedding(raw) {
+  if (raw == null) return null;
+  if (Array.isArray(raw)) {
+    return raw.map((v) => Number(v));
+  }
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim();
+    if (!trimmed) return null;
+    // Hapus bracket dan parse comma-separated
+    const inner = trimmed.replace(/^\[/, '').replace(/\]$/, '');
+    return inner.split(',').map((s) => Number(s.trim()));
+  }
+  return null;
+}
+
+/**
+ * Helper: format embedding array ke string pgvector '[a,b,c]'.
+ * Jika embedding null/undefined atau bukan array valid, return null.
+ */
+function formatEmbeddingForDB(embedding) {
+  if (!embedding || !Array.isArray(embedding) || embedding.length === 0) return null;
+  if (embedding.length !== EMBEDDING_DIM) {
+    throw new Error(
+      `[memory/store] embedding harus array of ${EMBEDDING_DIM} floats (got ${embedding.length})`
+    );
+  }
+  return '[' + embedding.map((f) => Number(f).toFixed(8)).join(',') + ']';
+}
+
+/**
  * Simpan durable memory + embedding vector (384-dim).
  * - memory_type = 'durable'
  * - Tidak expire (durable = persistent)
- * - Embedding WAJIB diisi (akan ditolak jika NULL).
+ * - Embedding opsional jika kolom `embedding` tidak ada di DB (pgvector off).
+ *   Dalam mode itu, durable memory disimpan tanpa embedding dan
+ *   findSimilarDurable akan fallback ke text-based.
  *
  * @param {string} scopeType
  * @param {string} scopeId
@@ -293,7 +359,7 @@ async function deleteExplicitMemory(scopeType, scopeId, key, memoryType = 'expli
  * @param {number} [opts.confidenceScore=1.0]
  * @param {object} [opts.metadata={}]
  * @param {number[]} [opts.sourceMemoryIds]  row ID asal (untuk merge history)
- * @returns {Promise<{id, is_insert, embedding_dim}>}
+ * @returns {Promise<{id, is_insert, has_embedding, embedding_dim}>}
  */
 async function saveDurableMemory(scopeType, scopeId, content, opts = {}) {
   const {
@@ -308,45 +374,78 @@ async function saveDurableMemory(scopeType, scopeId, content, opts = {}) {
   if (!scopeType || !scopeId || !content) {
     throw new Error('[memory/store] saveDurableMemory: scopeType, scopeId, content wajib diisi');
   }
-  if (!embedding || !Array.isArray(embedding) || embedding.length !== EMBEDDING_DIM) {
+
+  // Tentukan apakah kolom embedding tersedia (cached di modul)
+  const hasVector = await detectHasVector();
+  let embeddingStr = null;
+  if (embedding != null) {
+    // Validasi dimensi (akan throw jika salah)
+    embeddingStr = formatEmbeddingForDB(embedding);
+  } else if (hasVector) {
+    // Kolom embedding ada tapi caller tidak mengirim embedding
     throw new Error(
-      `[memory/store] saveDurableMemory: embedding harus array of ${EMBEDDING_DIM} floats (got ${
-        embedding ? embedding.length : 'null'
-      })`
+      `[memory/store] saveDurableMemory: embedding harus array of ${EMBEDDING_DIM} floats (got null)`
+    );
+  } else {
+    console.warn(
+      '[memory/store] ⚠️ pgvector tidak aktif — saveDurableMemory simpan durable tanpa embedding.'
     );
   }
 
-  const embeddingStr = '[' + embedding.map((f) => Number(f).toFixed(8)).join(',') + ']';
-
-  const sql = `
-    INSERT INTO whatsapp_bot.memories
-      (scope_type, scope_id, memory_type, role, content, source, confidence_score, metadata, expires_at, embedding, source_memory_ids)
-    VALUES
-      ($1, $2, 'durable', $3, $4, $5, $6, $7::jsonb, NULL, $8::vector, $9::bigint[])
-    RETURNING id, embedding IS NOT NULL AS has_embedding
-  `;
   const finalMetadata = { ...metadata, durable_extracted_at: new Date().toISOString() };
-  const { rows } = await db.query(sql, [
-    scopeType,
-    scopeId,
-    role,
-    content,
-    source,
-    confidenceScore,
-    JSON.stringify(finalMetadata),
-    embeddingStr,
-    sourceMemoryIds,
-  ]);
+  let rows;
+  if (hasVector) {
+    const sql = `
+      INSERT INTO whatsapp_bot.memories
+        (scope_type, scope_id, memory_type, role, content, source, confidence_score, metadata, expires_at, embedding, source_memory_ids)
+      VALUES
+        ($1, $2, 'durable', $3, $4, $5, $6, $7::jsonb, NULL, $8::vector, $9::bigint[])
+      RETURNING id, embedding IS NOT NULL AS has_embedding
+    `;
+    const res = await db.query(sql, [
+      scopeType,
+      scopeId,
+      role,
+      content,
+      source,
+      confidenceScore,
+      JSON.stringify(finalMetadata),
+      embeddingStr,
+      sourceMemoryIds,
+    ]);
+    rows = res.rows;
+  } else {
+    const sql = `
+      INSERT INTO whatsapp_bot.memories
+        (scope_type, scope_id, memory_type, role, content, source, confidence_score, metadata, expires_at, source_memory_ids)
+      VALUES
+        ($1, $2, 'durable', $3, $4, $5, $6, $7::jsonb, NULL, $8::bigint[])
+      RETURNING id, FALSE AS has_embedding
+    `;
+    const res = await db.query(sql, [
+      scopeType,
+      scopeId,
+      role,
+      content,
+      source,
+      confidenceScore,
+      JSON.stringify(finalMetadata),
+      sourceMemoryIds,
+    ]);
+    rows = res.rows;
+  }
   return {
     id: rows[0].id,
     is_insert: true,
     has_embedding: rows[0].has_embedding,
-    embedding_dim: EMBEDDING_DIM,
+    embedding_dim: hasVector ? EMBEDDING_DIM : 0,
   };
 }
 
 /**
  * Ambil durable memory by ID.
+ * Exclude row yang sudah soft-deleted (expires_at <= NOW()) untuk konsistensi
+ * dengan v_durable_memories view.
  */
 async function getDurableMemory(memoryId) {
   const sql = `
@@ -355,6 +454,7 @@ async function getDurableMemory(memoryId) {
            created_at, updated_at, embedding IS NOT NULL AS has_embedding
     FROM whatsapp_bot.memories
     WHERE id = $1 AND memory_type = 'durable'
+      AND (expires_at IS NULL OR expires_at > NOW())
   `;
   const { rows } = await db.query(sql, [memoryId]);
   return rows[0] || null;
@@ -362,6 +462,8 @@ async function getDurableMemory(memoryId) {
 
 /**
  * List durable memory untuk scope tertentu, urut terbaru.
+ * Exclude row yang sudah soft-deleted (expires_at <= NOW()) untuk konsistensi
+ * dengan v_durable_memories view.
  */
 async function listDurableMemory(scopeType, scopeId, limit = 50) {
   const sql = `
@@ -369,6 +471,7 @@ async function listDurableMemory(scopeType, scopeId, limit = 50) {
            consolidated_at, created_at, updated_at
     FROM whatsapp_bot.memories
     WHERE scope_type=$1 AND scope_id=$2 AND memory_type='durable'
+      AND (expires_at IS NULL OR expires_at > NOW())
     ORDER BY created_at DESC LIMIT $3
   `;
   const { rows } = await db.query(sql, [scopeType, scopeId, limit]);
@@ -379,34 +482,35 @@ async function listDurableMemory(scopeType, scopeId, limit = 50) {
  * Cari top-K durable memory yang paling MIRIP dengan embedding query (cosine).
  * - Menggunakan pgvector <=> (cosine distance).
  * - Falls back ke text similarity (LIKE) jika pgvector tidak tersedia.
+ * - Exclude row yang sudah soft-deleted (expires_at <= NOW()).
  *
  * @param {string} scopeType
  * @param {string} scopeId
  * @param {number[]} queryEmbedding  array 384-dim
  * @param {number} [k=5]
  * @param {number} [minSimilarity=0.7]  cosine similarity threshold (0..1)
+ * @param {string} [textHint='']  untuk fallback text search (ILIKE)
  * @returns {Promise<Array<{id, content, similarity, ...}>>}
  */
 async function findSimilarDurable(scopeType, scopeId, queryEmbedding, k = 5, minSimilarity = 0.7, textHint = '') {
-  if (!queryEmbedding || queryEmbedding.length !== EMBEDDING_DIM) {
-    throw new Error(`[memory/store] findSimilarDurable: queryEmbedding harus ${EMBEDDING_DIM}-dim`);
-  }
-  const embeddingStr = '[' + queryEmbedding.map((f) => Number(f).toFixed(8)).join(',') + ']';
+  // Pakai cached flag hasVector (probe sekali saat startup)
+  const hasVector = await detectHasVector();
 
-  // Cek apakah pgvector aktif (kolom embedding ada)
-  let hasVector = false;
-  try {
-    const probe = await db.query(
-      `SELECT 1 FROM information_schema.columns
-       WHERE table_schema='whatsapp_bot' AND table_name='memories' AND column_name='embedding' LIMIT 1`
-    );
-    hasVector = probe.rows.length > 0;
-  } catch (e) {
-    hasVector = false;
-  }
+  // Expiry filter di-share antara mode vector & fallback
+  const expiryFilter = `(expires_at IS NULL OR expires_at > NOW())`;
 
   if (hasVector) {
-    const sql =`
+    // Validasi embedding hanya jika vector aktif
+    if (!queryEmbedding || !Array.isArray(queryEmbedding) || queryEmbedding.length !== EMBEDDING_DIM) {
+      throw new Error(
+        `[memory/store] findSimilarDurable: queryEmbedding harus ${EMBEDDING_DIM}-dim (got ${
+          queryEmbedding ? (Array.isArray(queryEmbedding) ? queryEmbedding.length : typeof queryEmbedding) : 'null'
+        })`
+      );
+    }
+    const embeddingStr = '[' + queryEmbedding.map((f) => Number(f).toFixed(8)).join(',') + ']';
+
+    const sql = `
       SELECT
         id, content, source, confidence_score, version, metadata,
         consolidated_at, created_at, updated_at,
@@ -414,6 +518,7 @@ async function findSimilarDurable(scopeType, scopeId, queryEmbedding, k = 5, min
       FROM whatsapp_bot.memories
       WHERE scope_type=$1 AND scope_id=$2 AND memory_type='durable'
         AND embedding IS NOT NULL
+        AND ${expiryFilter}
         AND (1 - (embedding <=> $4::vector)) >= $5
       ORDER BY embedding <=> $4::vector
       LIMIT $3
@@ -431,6 +536,7 @@ async function findSimilarDurable(scopeType, scopeId, queryEmbedding, k = 5, min
            0.5::float AS similarity
     FROM whatsapp_bot.memories
     WHERE scope_type=$1 AND scope_id=$2 AND memory_type='durable'
+      AND ${expiryFilter}
       AND content ILIKE $3
     ORDER BY created_at DESC LIMIT $4
   `;
@@ -458,7 +564,6 @@ async function mergeDurableMemories(memoryIds, opts = {}) {
     throw new Error('[memory/store] mergeDurableMemories: butuh >= 2 memory IDs');
   }
   // Ambil semua row
-  const idsStr = memoryIds.join(',');
   const selectSql = `
     SELECT id, content, version, source_memory_ids, confidence_score, metadata
     FROM whatsapp_bot.memories
@@ -591,11 +696,25 @@ async function runConsolidationJob(opts = {}) {
   for (const cand of candidates) {
     if (!cand.embedding) continue;  // skip row tanpa embedding
 
+    // Parse embedding mentah dari DB (bisa string "[a,b,c]" atau array)
+    // Penting: type parser pg untuk vector belum tentu terpasang, jadi kita
+    // parse di sini sebagai safety net. Jika sudah array (parser terpasang),
+    // parseEmbedding akan return array of float.
+    let queryEmb = parseEmbedding(cand.embedding);
+    if (!queryEmb || queryEmb.length !== EMBEDDING_DIM) {
+      console.warn(
+        `[memory/store] ⚠️ skip cand id=${cand.id}: embedding bukan ${EMBEDDING_DIM}-dim ` +
+        `(got ${queryEmb ? queryEmb.length : 'null'})`
+      );
+      errors += 1;
+      continue;
+    }
+
     // 2. Cari top-5 mirip
     const sims = await findSimilarDurable(
       cand.scope_type,
       cand.scope_id,
-      cand.embedding,  // reuse embedding (sudah string di-row)
+      queryEmb,
       5,
       similarityThreshold
     ).catch((e) => {
@@ -649,6 +768,11 @@ module.exports = {
   mergeDurableMemories,
   markConsolidated,
   runConsolidationJob,
+  // Helpers (Fase 2 bugfix)
+  parseEmbedding,
+  formatEmbeddingForDB,
+  detectHasVector,
+  hasEmbeddingColumn,
   // Constants
   RETENTION_DAYS,
   DEFAULT_LIMIT,
