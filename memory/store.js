@@ -938,6 +938,115 @@ async function deleteMemoriesByScope(scopeId, opts = {}) {
   }
 }
 
+
+// =============================================================================
+// TASK-057 (Fase 3): Implicit Memory API + Aggregate Job
+// =============================================================================
+const stopwords = require('./stopwords_id.js');
+
+const IMPLICIT_MIN_INTERACTIONS = parseInt(process.env.WHATSAPP_MEMORY_IMPLICIT_MIN_INTERACTIONS || '5', 10);
+const IMPLICIT_TOP_N = parseInt(process.env.WHATSAPP_MEMORY_IMPLICIT_TOP_N || '10', 10);
+const IMPLICIT_LOOKBACK_DAYS = parseInt(process.env.WHATSAPP_MEMORY_IMPLICIT_LOOKBACK_DAYS || '7', 10);
+const IMPLICIT_RETENTION_DAYS = parseInt(process.env.WHATSAPP_MEMORY_IMPLICIT_RETENTION_DAYS || '90', 10);
+
+function tokenizeId(text) {
+  if (!text) return [];
+  return text.toLowerCase()
+    .replace(/[^\w\sà-ÿ]/g, ' ')
+    .split(/\s+/)
+    .filter((w) => w.length >= 3)
+    .filter((w) => !stopwords.isStopwordId(w));
+}
+
+async function aggregateImplicitPatterns(opts = {}) {
+  const start = Date.now();
+  const {
+    scopeType = 'personal',
+    minInteractions = IMPLICIT_MIN_INTERACTIONS,
+    topN = IMPLICIT_TOP_N,
+    lookbackDays = IMPLICIT_LOOKBACK_DAYS,
+    retentionDays = IMPLICIT_RETENTION_DAYS,
+  } = opts;
+  console.log(`[memory/store] 🧠 ImplicitAggregate mulai (lookback=${lookbackDays}d, min_interactions=${minInteractions}, topN=${topN})`);
+  const baseSql = `
+    SELECT scope_id, created_at, content
+    FROM whatsapp_bot.memories
+    WHERE memory_type = 'recent' AND role = 'user' AND scope_type = $1
+      AND created_at >= NOW() - ($2 || ' days')::interval
+      AND (expires_at IS NULL OR expires_at > NOW())
+    ORDER BY scope_id, created_at
+  `;
+  let scopes_scanned = 0, scopes_written = 0, errors = 0;
+  try {
+    const { rows: allRows } = await db.query(baseSql, [scopeType, String(lookbackDays)]);
+    if (allRows.length === 0) {
+      return { scopes_scanned: 0, scopes_written: 0, errors: 0, duration_ms: Date.now() - start };
+    }
+    const byScope = {};
+    for (const r of allRows) {
+      if (!byScope[r.scope_id]) byScope[r.scope_id] = { hours: new Array(24).fill(0), words: {}, count: 0 };
+      const b = byScope[r.scope_id];
+      b.count += 1;
+      const hour = (r.created_at instanceof Date) ? r.created_at.getUTCHours() : parseInt(String(r.created_at).substring(11, 13), 10);
+      if (hour >= 0 && hour < 24) b.hours[hour] += 1;
+      for (const w of tokenizeId(r.content)) b.words[w] = (b.words[w] || 0) + 1;
+    }
+    scopes_scanned = Object.keys(byScope).length;
+    for (const [scopeId, b] of Object.entries(byScope)) {
+      if (b.count < minInteractions) continue;
+      const topWords = Object.entries(b.words).sort((a, b) => b[1] - a[1]).slice(0, topN).map(([w, c]) => ({ word: w, count: c }));
+      const peakHour = b.hours.indexOf(Math.max(...b.hours));
+      const metadata = {
+        auto_generated: true, kind: 'interaction_pattern', schema_version: 1,
+        interaction_count: b.count, hour_histogram: b.hours, peak_hour_utc: peakHour,
+        top_words: topWords, lookback_days: lookbackDays, generated_at: new Date().toISOString(),
+      };
+      const content = `Pola interaksi ${b.count} pesan user dalam ${lookbackDays} hari terakhir. Peak hour: ${peakHour}:00 UTC. Top kata: ${topWords.slice(0, 5).map(w => `${w.word}(${w.count})`).join(', ')}.`;
+      const expiresAtSql = `NOW() + INTERVAL '${retentionDays} days'`;
+      const insertSql = `
+        INSERT INTO whatsapp_bot.memories
+          (scope_type, scope_id, memory_type, role, content, source, confidence_score, metadata, expires_at)
+        VALUES ($1, $2, 'implicit', 'system', $3, 'inferred', 0.5, $4::jsonb, ${expiresAtSql})
+        RETURNING id, expires_at
+      `;
+      try {
+        const { rows: insRows } = await db.query(insertSql, [scopeType, scopeId, content, JSON.stringify(metadata)]);
+        scopes_written += 1;
+        console.log(`[memory/store] 🧠 ImplicitAggregate: wrote ${scopeId} (id=${insRows[0].id}, ${b.count} interactions, peak=${peakHour}:00, ${topWords.length} top_words, expires=${insRows[0].expires_at})`);
+      } catch (e) { errors += 1; console.warn(`[memory/store] ⚠️ ImplicitAggregate insert error for ${scopeId}: ${e.message}`); }
+    }
+  } catch (e) { errors += 1; console.error('[memory/store] ❌ aggregateImplicitPatterns error:', e.message); }
+  const duration = Date.now() - start;
+  console.log(`[memory/store] 🧠 ImplicitAggregate selesai: scanned=${scopes_scanned}, written=${scopes_written}, errors=${errors}, duration=${duration}ms`);
+  return { scopes_scanned, scopes_written, errors, duration_ms: duration };
+}
+
+async function getImplicitPatterns(scopeId, opts = {}) {
+  const { scopeType = 'personal', limit = 20 } = opts;
+  if (!scopeId) throw new Error('[memory/store] getImplicitPatterns: scopeId wajib diisi');
+  const sql = `
+    SELECT id, content, metadata, confidence_score, created_at, expires_at
+    FROM whatsapp_bot.memories
+    WHERE memory_type = 'implicit' AND scope_type = $1 AND scope_id = $2
+      AND (expires_at IS NULL OR expires_at > NOW())
+    ORDER BY created_at DESC LIMIT $3
+  `;
+  try { const { rows } = await db.query(sql, [scopeType, scopeId, limit]); return rows; }
+  catch (err) { console.error('[memory/store] ❌ getImplicitPatterns error:', err.message); return []; }
+}
+
+async function purgeImplicitOlderThan(days = 0) {
+  const sql = days > 0
+    ? `DELETE FROM whatsapp_bot.memories WHERE memory_type = 'implicit' AND expires_at < NOW() - ($1 || ' days')::interval RETURNING id`
+    : `DELETE FROM whatsapp_bot.memories WHERE memory_type = 'implicit' AND expires_at < NOW() RETURNING id`;
+  try {
+    const { rows } = days > 0 ? await db.query(sql, [String(days)]) : await db.query(sql);
+    const count = rows.length;
+    if (count > 0) console.log(`[memory/store] 🧹 Purged ${count} implicit memories (older than ${days}d)`);
+    return { deleted_count: count };
+  } catch (err) { console.error('[memory/store] ❌ purgeImplicitOlderThan error:', err.message); return { deleted_count: 0 }; }
+}
+
 module.exports = {
   // Fase 1a-1d
   saveMessage,
@@ -964,6 +1073,11 @@ module.exports = {
   searchMemoriesByScope,
   getMemoryStats,
   deleteMemoriesByScope,
+  // TASK-057 (Fase 3) - Implicit memory
+  aggregateImplicitPatterns,
+  getImplicitPatterns,
+  purgeImplicitOlderThan,
+  tokenizeId,
   // Helpers (Fase 2 bugfix)
   parseEmbedding,
   formatEmbeddingForDB,
@@ -979,4 +1093,9 @@ module.exports = {
   CONSOLIDATION_SIMILARITY_THRESHOLD,
   CONSOLIDATION_BATCH_SIZE,
   EMBEDDING_DIM,
+  // TASK-057 (Fase 3) constants
+  IMPLICIT_MIN_INTERACTIONS,
+  IMPLICIT_TOP_N,
+  IMPLICIT_LOOKBACK_DAYS,
+  IMPLICIT_RETENTION_DAYS,
 };
