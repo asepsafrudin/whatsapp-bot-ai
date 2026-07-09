@@ -462,6 +462,38 @@ async function startBot() {
           console.error('[Memory] ConsolidationJob error:', err.message)
         );
       }, { timezone: 'Asia/Jakarta' });
+
+      // ===== TASK-057 (Fase 3): ImplicitAggregate scheduler =====
+      // Setiap MINGGU 02:00 WIB, jalankan aggregateImplicitPatterns() untuk
+      // scan pola interaksi user (recent user messages 7 hari terakhir)
+      // dan simpan sebagai memory_type='implicit' (soft-delete 90 hari).
+      const IMPLICIT_CRON = process.env.WHATSAPP_MEMORY_IMPLICIT_CRON || '0 2 * * 0';
+      console.log(`[Memory] ImplicitAggregate dijadwalkan: cron="${IMPLICIT_CRON}" (timezone Asia/Jakarta)`);
+      cron.schedule(IMPLICIT_CRON, () => {
+        console.log('[Memory] 🧠 Trigger ImplicitAggregate (Fase 3)...');
+        memoryStore.aggregateImplicitPatterns({
+          minInteractions: parseInt(process.env.WHATSAPP_MEMORY_IMPLICIT_MIN_INTERACTIONS || '5', 10),
+          topN: parseInt(process.env.WHATSAPP_MEMORY_IMPLICIT_TOP_N || '10', 10),
+          lookbackDays: parseInt(process.env.WHATSAPP_MEMORY_IMPLICIT_LOOKBACK_DAYS || '7', 10),
+        }).then((stats) => {
+          console.log(`[Memory] 🧠 ImplicitAggregate selesai: ${JSON.stringify(stats)}`);
+        }).catch(err =>
+          console.error('[Memory] ImplicitAggregate error:', err.message)
+        );
+      }, { timezone: 'Asia/Jakarta' });
+
+      // ===== TASK-057 (Fase 3): Implicit purge scheduler (daily) =====
+      // Setiap jam 03:30 WIB, hapus implicit memory yang sudah expire.
+      // (Sama jadwalnya dengan purge recent, tapi beda filter memory_type.)
+      const IMPLICIT_PURGE_CRON = process.env.WHATSAPP_MEMORY_IMPLICIT_PURGE_CRON || '30 3 * * *';
+      cron.schedule(IMPLICIT_PURGE_CRON, () => {
+        console.log('[Memory] 🧹 Trigger implicit purge (Fase 3)...');
+        memoryStore.purgeImplicitOlderThan(0).then((r) => {
+          if (r.deleted_count > 0) console.log(`[Memory] 🧹 Implicit purged: ${r.deleted_count}`);
+        }).catch(err =>
+          console.error('[Memory] Implicit purge error:', err.message)
+        );
+      }, { timezone: 'Asia/Jakarta' });
     }
   });
 
