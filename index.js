@@ -31,7 +31,31 @@ if (!WEBHOOK_SECRET) {
 
 // Inisialisasi Express Webhook Server
 const app = express();
+// Body parsers — PENTING: express.urlencoded WAJIB didaftarkan SEBELUM
+// route yang membaca req.body (lihat admin_routes.js). Tanpa ini,
+// form submit di /admin/search dan /admin/delete akan gagal (req.body undefined).
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+// =============================================================================
+// TASK-056 (Fase 6): Hardening bind admin UI ke 127.0.0.1 saja.
+// =============================================================================
+// Webhook server dipakai untuk 2 hal:
+//   1) WhatsApp webhook dari orchestrator (/webhook/whatsapp, /memory/save_durable, dll)
+//      → WAJIB reachable dari orchestrator (bisa di host berbeda, jadi 0.0.0.0 OK)
+//   2) Admin UI (/admin/*) → WAJIB localhost-only (keamanan)
+//
+// Solusi: kita listen ke 127.0.0.1 jika WEBHOOK_BIND_ADMIN_LOCALHOST=true
+// (default true). Untuk production multi-host, set env ke false & pakai
+// reverse proxy (Caddy/nginx) untuk expose webhook ke public tapi block /admin/*.
+// =============================================================================
+const BIND_ADMIN_LOCALHOST = process.env.WEBHOOK_BIND_ADMIN_LOCALHOST !== 'false';
+if (BIND_ADMIN_LOCALHOST) {
+  console.log('[Init] ⚠️  Webhook server akan bind ke 127.0.0.1 (admin UI aman, webhook only reachable dari local)');
+} else {
+  console.warn('[Init] ⚠️  WEBHOOK_BIND_ADMIN_LOCALHOST=false — server bind ke 0.0.0.0!');
+  console.warn('[Init]    Pastikan /admin/* di-block dari public via reverse proxy!');
+}
 
 // =============================================================================
 // TASK-053: Real-time contacts.upsert hook → public.member_profiles
@@ -241,8 +265,15 @@ app.get('/api/group/:group_id/messages', (req, res) => {
   res.status(200).json({ messages: sliced });
 });
 
-app.listen(WEBHOOK_PORT, () => {
-  console.log(`🚀 Webhook Server berjalan di port ${WEBHOOK_PORT}`);
+// Bind host — lihat BIND_ADMIN_LOCALHOST di atas.
+const BIND_HOST = BIND_ADMIN_LOCALHOST ? '127.0.0.1' : '0.0.0.0';
+app.listen(WEBHOOK_PORT, BIND_HOST, () => {
+  console.log(`🚀 Webhook Server berjalan di ${BIND_HOST}:${WEBHOOK_PORT}`);
+  if (BIND_ADMIN_LOCALHOST) {
+    console.log('   [Admin UI] http://127.0.0.1:' + WEBHOOK_PORT + '/admin/?token=$ADMIN_TOKEN');
+  } else {
+    console.warn('   [⚠️ Admin UI] http://0.0.0.0:' + WEBHOOK_PORT + '/admin/* (EXPOSED — pakai reverse proxy!)');
+  }
 });
 
 // =============================================================================
