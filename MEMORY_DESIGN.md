@@ -1,7 +1,7 @@
 # Memory Design — `services/whatsapp-bot-ai/`
 
-> **Task:** TASK-047 (1a) + TASK-048 (1b) + TASK-049 (1c) + TASK-050 (1d) + **TASK-053 (1e)** + **TASK-054 (5)** + **TASK-055 (2)** + **TASK-056 (6)**
-> **Status:** 🟢 COMPLETED (Fase 1a + 1b + 1c + 1d + 1e + **2** + **5** + **6**)
+> **Task:** TASK-047 (1a) + TASK-048 (1b) + TASK-049 (1c) + TASK-050 (1d) + **TASK-053 (1e)** + **TASK-054 (5)** + **TASK-055 (2)** + **TASK-056 (6)** + **TASK-057 (3)**
+> **Status:** 🟢 COMPLETED (Fase 1a + 1b + 1c + 1d + 1e + **2** + **3** + **5** + **6**)
 > **Referensi utama:** [`docs/09-proposals/Diagram_Memori_AI_Agent_Revisi.md`](../../docs/09-proposals/Diagram_Memori_AI_Agent_Revisi.md)
 
 ## 1. Tujuan
@@ -858,6 +858,124 @@ Penting untuk disadari: env var `WEBHOOK_BIND_ADMIN_LOCALHOST=true` (default) me
 - `services/whatsapp-bot-ai/MEMORY_DESIGN.md` — section 6.10 (Fase 6) + roadmap updated
 
 
+
+## 6.11. Implicit Memory & Pola Interaksi (Fase 3 — TASK-057)
+
+Per 2026-07-09, **Implicit Memory** aktif: cron job mingguan aggregate pola interaksi user dari chat history, disimpan sebagai `memory_type='implicit'`. Berbeda dari `durable` (Fase 2) yang menangkap fakta eksplisit dari LLM extract, `implicit` menangkap **pola perilaku** yang disimpulkan (jam aktif, kata/topik populer).
+
+### 6.11.1. Apa yang Berbeda dari Fase Lain
+
+| Aspek | `recent` | `durable` (Fase 2) | `implicit` (Fase 3, BARU) |
+|---|---|---|---|
+| **Expire** | Ya (30 hari, hard purge) | Tidak (persistent) | **Ya (90 hari, hard purge)** |
+| **Trigger** | Otomatis chat | LLM extract dari chat history | **Cron mingguan (auto-aggregate)** |
+| **Isi** | Pesan chat asli | Fakta yang di-rewrite LLM | **Pola jam + kata (statistik)** |
+| **Lookup** | `created_at` ORDER BY | Cosine similarity (pgvector) | Per-scope (admin inspect) |
+| **Confidence** | 1.0 | 0.7 (extraction_confidence) | **0.5 (auto-generated)** |
+| **Source** | `inferred` | `inferred` | `inferred` (auto_generated: true di metadata) |
+| **Dipakai LLM context?** | ✅ Ya | ✅ Ya | **❌ TIDAK** (hanya admin inspect) |
+
+### 6.11.2. Skema — Tidak Butuh Kolom Baru
+
+Implicit memory pakai kolom existing di `whatsapp_bot.memories`:
+- `memory_type='implicit'`
+- `role='system'` (auto-generated, bukan user/assistant)
+- `content='Pola interaksi N pesan user dalam 7 hari terakhir. Peak hour: HH:00 UTC. Top kata: ...'`
+- `metadata` JSONB: `{ auto_generated, kind='interaction_pattern', schema_version=1, interaction_count, hour_histogram[24], peak_hour_utc, top_words[{word,count}], lookback_days, generated_at }`
+- `confidence_score=0.5`
+- `expires_at = NOW() + 90 days` (soft delete)
+- `source='inferred'`
+
+Index baru (di `migration_057_implicit_memory.sql`):
+- `idx_memories_recent_user_personal` — composite `(scope_id, created_at DESC)` partial WHERE `memory_type='recent' AND role='user' AND scope_type='personal' (untuk aggregate query)
+- `idx_memories_implicit_scope` — composite `(scope_id, created_at DESC)` partial WHERE `memory_type='implicit' (untuk inspect)
+- `idx_memories_implicit_expires` — `expires_at` partial WHERE `memory_type='implicit' AND expires_at IS NOT NULL (untuk purge)
+
+### 6.11.3. Filter Query — KRITIS untuk Mencegah Bias Histogram
+
+```sql
+-- Yang BENAR (digunakan):
+WHERE memory_type = \'recent\' AND role = \'user\' AND scope_type = \'personal\'
+
+-- Yang SALAH (jangan pakai):
+WHERE memory_type IN (\'recent\', \'durable\')     -- ❌ durable = hasil merge cron 04:00, bias histogram jam
+WHERE role IN (\'user\', \'assistant\')           -- ❌ frasa LLM generic mendominasi top_words
+```
+
+**Alasan** (audit user 2026-07-09):
+- `durable` = hasil `ConsolidationJob` (cron 04:00 WIB) yang merge fakta. Bukan chat asli user. Kalau ikut dihitung, histogram jam akan selalu lonjakan palsu jam 4 pagi.
+- `assistant` = balasan LLM dengan frasa generic ("tentu", "berikut", "semoga"). Kalau ikut dihitung, top-words jadi noise.
+
+### 6.11.4. API Store (TASK-057) — di `memory/store.js`
+
+```js
+const store = require(\'./memory/store.js\');
+
+// 1. Aggregate pola interaksi (dipanggil cron mingguan)
+const stats = await store.aggregateImplicitPatterns({
+  scopeType: \'personal\',          // \'personal\' (skip grup untuk v1)
+  minInteractions: 5,              // skip scope dengan < 5 interaksi
+  topN: 10,                        // top-10 kata
+  lookbackDays: 7,                 // window analisis
+  retentionDays: 90,              // soft-delete
+});
+// → { scopes_scanned: 3, scopes_written: 2, errors: 0, duration_ms: 21 }
+
+// 2. Ambil implicit memory per scope (admin inspect)
+const patterns = await store.getImplicitPatterns(\'628xxx@s.whatsapp.net\');
+// → [{ id, content, metadata: { interaction_count, hour_histogram, top_words, ... }, ... }]
+
+// 3. Hard delete implicit yang expire (cron harian)
+const purge = await store.purgeImplicitOlderThan(0);
+// → { deleted_count: 5 }
+
+// 4. Tokenizer (test/inspect)
+const words = store.tokenizeId(\'Saya Budi dari Bagian PUU, alergi seafood\');
+// → [\'budi\', \'bagian\', \'puu\', \'alergi\', \'seafood\']  (filtered stopwords, min 3 char)
+```
+
+### 6.11.5. Stopwords Indonesia
+
+`memory/stopwords_id.js` — ~30 stopword bahasa Indonesia (`yang, dan, itu, di, ke, dari, untuk, dengan, pada, sebagai, adalah, ada, ini, juga, akan, atau, jika, karena, tetapi, namun, jadi, sudah, belum, tidak, ya, sih, deh, dong, kok, kayak, gitu, aja, banget`).
+
+**Tokenize**: lowercase → remove punctuation (keep UTF-8 letters à-ÿ) → split whitespace → filter `length >= 3` → filter stopwords.
+
+### 6.11.6. Cron Scheduler (di `index.js`)
+
+| Cron | Default | Env var | Fungsi |
+|---|---|---|---|
+| `0 2 * * 0` (Minggu 02:00 WIB) | `WHATSAPP_MEMORY_IMPLICIT_CRON` | `aggregateImplicitPatterns()` |
+| `30 3 * * *` (harian 03:30 WIB) | `WHATSAPP_MEMORY_IMPLICIT_PURGE_CRON` | `purgeImplicitOlderThan(0)` |
+
+### 6.11.7. Test Results (di DB nyata `mcp_knowledge`)
+
+```
+tokenizeId: 16 token meaningful (puu, budi, santoso, alergi, seafood, ...)
+aggregateImplicitPatterns: scanned=3, written=2, errors=0, duration=21ms
+top words: puu(4), tolong(3), budi(2), santoso(2), kasih(2) — SANGAT meaningful
+peak hour: 1:00 UTC (= 08:00 WIB, office hours) — valid
+cleanup via deleteMemoriesByScope: 9 rows deleted (1 implicit + 8 recent)
+```
+
+### 6.11.8. Limitasi Fase 3 (Sengaja)
+
+- ⏳ Skip grup chat untuk v1 (hanya personal). Grup punya noise multi-user.
+- ⏳ Tidak ada topic modeling LLM (cukup word frequency + stopwords).
+- ⏳ Tidak ada sentiment analysis.
+- ⏳ Tidak ada cross-user aggregation (per-user saja dulu).
+- ⏳ Tidak ada real-time implicit (semua via cron batch).
+- ⏳ Tidak dipakai sebagai LLM context (risiko bias interpretasi: "user sering chat jam 11 malam" bisa disalahartikan LLM jadi asumsi tentang gaya hidup user).
+
+### 6.11.9. File yang Diubah (Fase 3 — TASK-057)
+
+- `services/whatsapp-bot-ai/memory/migration_057_implicit_memory.sql` (BARU) — 3 index partial
+- `services/whatsapp-bot-ai/memory/stopwords_id.js` (BARU) — ~30 stopword ID
+- `services/whatsapp-bot-ai/memory/store.js` (+ 4 API: `aggregateImplicitPatterns`, `getImplicitPatterns`, `purgeImplicitOlderThan`, `tokenizeId`)
+- `services/whatsapp-bot-ai/index.js` (+ 2 cron scheduler)
+- `services/whatsapp-bot-ai/MEMORY_DESIGN.md` — section 6.11 (Fase 3) + roadmap updated
+- `tasks/01_active/TASK-057-implicit-memory-fase3/README.md` (task manifest)
+
+
 ## 7. Limitasi Fase 1a + 1b + 1c + 1d + 1e + 5 (Sengaja Ditunda)
 
 - ❌ **Profile, Explicit, Durable, Implicit memory belum ada** — hanya `recent` yang aktif.
@@ -876,7 +994,7 @@ Penting untuk disadari: env var `WEBHOOK_BIND_ADMIN_LOCALHOST=true` (default) me
 | **1e** | DB-first contacts: `public.member_profiles` sebagai SoT, `rbac.py` load dari DB, `index.js` real-time upsert, agent tool `sync_contacts` | ✅ COMPLETED (TASK-053) |
 | **5** | Explicit memory (`!ingat key: value` / `!lupa` / `!profile` / `!memory`) + durable storage + indexes | ✅ COMPLETED (TASK-054) |
 | **2** | Endpoint `/api/v1/memory/extract` di ai-orchestrator; ConsolidationJob (similarity check, merge, versioning) | ✅ COMPLETED (TASK-055) |
-| **3** | Implicit memory (async batch cron) — pola interaksi, jam aktif, topik populer | ⏳ BACKLOG |
+| **3** | Implicit memory (auto-extract pola interaksi — jam aktif + topik) | ✅ COMPLETED (TASK-057) |
 | **4** | Durable memory + semantic search (pgvector) + integrasi knowledge base PUU | ⏳ BACKLOG |
 | **5** | Explicit memory (`!ingat ...`); Profile memory (preferensi user) | ⏳ BACKLOG |
 | **6** | Admin UI / CLI untuk lihat, hapus, export memori | ✅ COMPLETED (TASK-056) |
