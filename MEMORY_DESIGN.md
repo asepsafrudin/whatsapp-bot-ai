@@ -1,7 +1,7 @@
 # Memory Design — `services/whatsapp-bot-ai/`
 
-> **Task:** TASK-047 (1a) + TASK-048 (1b) + TASK-049 (1c) + TASK-050 (1d) + **TASK-053 (1e)** + **TASK-054 (5)** + **TASK-055 (2)**
-> **Status:** 🟢 COMPLETED (Fase 1a + 1b + 1c + 1d + 1e + **2** + **5**)
+> **Task:** TASK-047 (1a) + TASK-048 (1b) + TASK-049 (1c) + TASK-050 (1d) + **TASK-053 (1e)** + **TASK-054 (5)** + **TASK-055 (2)** + **TASK-056 (6)**
+> **Status:** 🟢 COMPLETED (Fase 1a + 1b + 1c + 1d + 1e + **2** + **5** + **6**)
 > **Referensi utama:** [`docs/09-proposals/Diagram_Memori_AI_Agent_Revisi.md`](../../docs/09-proposals/Diagram_Memori_AI_Agent_Revisi.md)
 
 ## 1. Tujuan
@@ -693,6 +693,156 @@ WHATSAPP_BOT_URL=http://localhost:3001               # callback ke bot
 - `services/whatsapp-bot-ai/MEMORY_DESIGN.md` (section 6.9 + roadmap update)
 
 
+## 6.10. Admin CLI & Web UI (Fase 6 — TASK-056)
+
+Per 2026-07-09, **Admin CLI + Web UI** untuk inspeksi manual, monitoring, dan **hard-delete (GDPR)** tersedia. Memungkinkan:
+- Validasi hasil auto-extract (Fase 3 nanti).
+- Kepatuhan GDPR (right-to-be-forgotten).
+- Audit data per user.
+
+### 6.10.1. Dua Antarmuka: CLI & Web UI
+
+| Aspek | CLI (`bin/admin-memory-cli.js`) | Web UI (`/admin/*`) |
+|---|---|---|
+| **Akses** | SSH / terminal langsung | Browser ke `http://127.0.0.1:3001/admin/?token=...` |
+| **Auth** | Tidak ada (siapa saja yang bisa SSH = admin) | `ADMIN_TOKEN` (header `X-Admin-Token` atau query `?token=`) |
+| **Bind** | Tidak perlu | **WAJIB 127.0.0.1** (tidak boleh 0.0.0.0) |
+| **Fitur** | search / stats / delete (--confirm) | search / stats / delete (form konfirmasi) |
+| **Kapan pakai** | Cron jobs, scripting, server admin | Insidental inspection, audit, demo ke stakeholder |
+
+### 6.10.2. Tiga API Store (TASK-056) — di `memory/store.js`
+
+```js
+// 1. searchMemoriesByScope(scopeId, opts) — list memory per user
+const result = await store.searchMemoriesByScope('628xxx@s.whatsapp.net', {
+  scopeType: 'personal',          // 'personal' | 'group'
+  memoryTypes: ['recent', 'explicit', 'durable'],  // null = semua
+  includeExpired: false,         // true = ikut sertakan row expires_at <= NOW()
+  limit: 100,
+});
+// → { count: 5, byType: { recent: 3, explicit: 1, durable: 1 }, rows: [...] }
+
+// 2. getMemoryStats(opts) — statistik global
+const stats = await store.getMemoryStats({ scopeType: null });
+// → { total, byType, oldest, newest, growth: {last_1d, last_7d, last_30d}, top_scopes: [...] }
+
+// 3. deleteMemoriesByScope(scopeId, opts) — HARD DELETE (GDPR)
+const result = await store.deleteMemoriesByScope('628xxx@s.whatsapp.net', {
+  scopeType: 'personal',
+  memoryTypes: ['recent'],  // null = semua, atau subset
+});
+// → { deleted_count: 5, byType: { recent: 5 } }
+// log: '[memory/store] 🗑️ GDPR delete: 5 rows from personal:628xxx@s.whatsapp.net ({"recent":5})'
+```
+
+**Perbedaan kunci dari Fase 2**:
+- Fase 2 (ConsolidationJob): **SOFT delete** (`expires_at = NOW()`) — bisa di-audit.
+- Fase 6 (Admin Delete): **HARD delete** (`DELETE FROM ...`) — hilang permanen, sesuai GDPR.
+
+### 6.10.3. CLI: `bin/admin-memory-cli.js`
+
+Sub-commands:
+
+```bash
+# Help
+node bin/admin-memory-cli.js help
+
+# Search memory satu user
+node bin/admin-memory-cli.js search --scope-id 628xxx@s.whatsapp.net
+node bin/admin-memory-cli.js search --scope-id 628xxx@s.whatsapp.net --memory-type explicit,durable
+node bin/admin-memory-cli.js search --scope-id 628xxx@s.whatsapp.net --include-expired --limit 100
+
+# Stats global / per scope_type
+node bin/admin-memory-cli.js stats
+node bin/admin-memory-cli.js stats --scope-type personal
+
+# Hard delete (WAJIB --confirm!)
+node bin/admin-memory-cli.js delete --scope-id 628xxx@s.whatsapp.net --confirm
+node bin/admin-memory-cli.js delete --scope-id 628xxx@s.whatsapp.net --memory-type explicit --confirm
+```
+
+Penting: `--confirm` WAJIB untuk delete (mencegah accidental data loss via shell history / typo).
+
+### 6.10.4. Web UI: `/admin/*`
+
+| Route | Method | Fungsi |
+|---|---|---|
+| `/admin/` | GET | Dashboard (link ke search/stats/delete) |
+| `/admin/search` | GET | Form search kosong |
+| `/admin/search` | POST | Eksekusi search, return tabel row |
+| `/admin/stats` | GET | Statistik global (cards + tabel top scopes) |
+| `/admin/delete` | GET | Form konfirmasi (WAJIB ketik ulang scope_id) |
+| `/admin/delete` | POST | Eksekusi hard-delete |
+
+**Auth middleware**:
+```js
+// requireAdminToken(req, res, next)
+// 1. Cek ADMIN_TOKEN env (atau MCP_ADMIN_TOKEN fallback)
+// 2. Validasi token dari header `X-Admin-Token` ATAU query `?token=...`
+// 3. Tanpa token: 401 Unauthorized
+// 4. ADMIN_TOKEN tidak di-set: 503 (refuse start)
+```
+
+**UI features**:
+- Server-side render HTML (no React/build step) — sederhana, cepat.
+- HTML escape untuk semua user input (mencegah XSS).
+- Confirmation form delete: ketik ulang `scope_id` persis sama untuk konfirmasi.
+- Dashboard dengan link navigasi (search / stats / delete).
+
+### 6.10.5. Environment Variable Baru
+
+```bash
+# .env (bot + CLI share same env)
+ADMIN_TOKEN=<random-hex-32-chars>  # WAJIB untuk Web UI; CLI optional
+
+# Generate token:
+# node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+```
+
+**Tanpa ADMIN_TOKEN**: Web UI return 503. CLI tetap berfungsi (siapa saja yang punya akses SSH).
+
+### 6.10.6. Keamanan (TASK-056 — keputusan desain per user, 2026-07-09)
+
+| Aspek | Keputusan | Alasan |
+|---|---|---|
+| **Auth Web UI** | `ADMIN_TOKEN` static via env var | 1 admin, akses server langsung — OAuth/session overkill |
+| **Bind Web UI** | `127.0.0.1` saja (bukan `0.0.0.0`) | Tidak exposed ke internet — serangan dari luar diminimalkan |
+| **Delete (GDPR)** | HARD delete (`DELETE FROM ...`) | GDPR butuh penghapusan sungguhan, beda dari soft-delete Fase 2 |
+| **Konfirmasi** | CLI: `--confirm` flag. Web UI: ketik ulang scope_id | Mencegah accidental data loss |
+| **Scope** | Per-user (`scope_id`), bisa filter per `memory_type` | Partial delete (misal hanya `explicit`) lebih aman |
+
+### 6.10.7. Test Results (TASK-056)
+
+**CLI (di DB nyata, mcp_knowledge):**
+- ✅ `search` tanpa `--scope-id` → exit 2 + pesan jelas
+- ✅ `delete` tanpa `--confirm` → exit 2 + pesan jelas
+- ✅ `search existing scope` → 3 row durable (alergi seafood, anak Aisyah+Raffi, kerja PUU)
+- ✅ `search --memory-type recent` → 0 row (scope hanya punya durable)
+- ✅ `stats` → total 40, breakdown per type, 3 top scopes
+
+**Web UI (port 3009, ADMIN_TOKEN=test123):**
+- ✅ `/admin/` tanpa token → 401 Unauthorized (522 bytes)
+- ✅ `/admin/?token=test123` → 200 Dashboard (1106 bytes)
+- ✅ `/admin/stats?token=test123` → 200 Stats page, menampilkan Total=65
+- ✅ `/admin/delete?token=test123` → 200 Form konfirmasi (2088 bytes)
+
+### 6.10.8. Limitasi Fase 6 (Sengaja)
+
+- ⏳ Tidak ada export JSON/CSV di CLI (bisa ditambah nanti sebagai v1.1).
+- ⏳ Tidak ada audit log siapa yang delete apa (perlu log table baru).
+- ⏳ Tidak ada batch operations (hapus multiple user sekaligus).
+- ⏳ Tidak ada UI untuk edit/rollback memory (read + delete saja).
+- ⏳ Tidak ada bulk import (insert).
+
+### 6.10.9. File yang Diubah (Fase 6 — TASK-056)
+
+- `services/whatsapp-bot-ai/memory/store.js` (+ 3 API: `searchMemoriesByScope`, `getMemoryStats`, `deleteMemoriesByScope` + re-export `db.isReady`/`db.close`)
+- `services/whatsapp-bot-ai/bin/admin-memory-cli.js` (BARU) — CLI dengan sub-commands search/stats/delete
+- `services/whatsapp-bot-ai/admin_routes.js` (BARU) — Express router untuk `/admin/*` (search/stats/delete)
+- `services/whatsapp-bot-ai/index.js` (+ `app.use('/admin', adminRouter)`)
+- `services/whatsapp-bot-ai/MEMORY_DESIGN.md` — section 6.10 (Fase 6) + roadmap updated
+
+
 ## 7. Limitasi Fase 1a + 1b + 1c + 1d + 1e + 5 (Sengaja Ditunda)
 
 - ❌ **Profile, Explicit, Durable, Implicit memory belum ada** — hanya `recent` yang aktif.
@@ -714,7 +864,7 @@ WHATSAPP_BOT_URL=http://localhost:3001               # callback ke bot
 | **3** | Implicit memory (async batch cron) — pola interaksi, jam aktif, topik populer | ⏳ BACKLOG |
 | **4** | Durable memory + semantic search (pgvector) + integrasi knowledge base PUU | ⏳ BACKLOG |
 | **5** | Explicit memory (`!ingat ...`); Profile memory (preferensi user) | ⏳ BACKLOG |
-| **6** | Admin UI / CLI untuk lihat, hapus, export memori | ⏳ BACKLOG |
+| **6** | Admin UI / CLI untuk lihat, hapus, export memori | ✅ COMPLETED (TASK-056) |
 
 ## 9. Referensi
 
