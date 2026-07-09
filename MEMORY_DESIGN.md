@@ -811,6 +811,21 @@ ADMIN_TOKEN=<random-hex-32-chars>  # WAJIB untuk Web UI; CLI optional
 | **Konfirmasi** | CLI: `--confirm` flag. Web UI: ketik ulang scope_id | Mencegah accidental data loss |
 | **Scope** | Per-user (`scope_id`), bisa filter per `memory_type` | Partial delete (misal hanya `explicit`) lebih aman |
 
+#### ⚠️ Trade-off: WEBHOOK_BIND_ADMIN_LOCALHOST = whole-server bind
+
+Penting untuk disadari: env var `WEBHOOK_BIND_ADMIN_LOCALHOST=true` (default) mem-bind **seluruh** Express server ke `127.0.0.1`, **bukan cuma `/admin/*`**. Artinya:
+- ✅ Admin UI aman (tidak exposed ke internet)
+- ⚠️ Webhook endpoint (`/webhook/whatsapp`, `/memory/save_durable`, dll) juga hanya reachable dari `127.0.0.1`
+- Aman untuk setup saat ini (orchestrator + bot di host yang sama)
+- **Jebakan masa depan**: kalau `ai-orchestrator` dipindah ke container/server terpisah,
+  webhook callback dari orchestrator ke bot akan **diam-diam berhenti berfungsi** (tidak ada
+  error, hanya bot tidak menerima balasan). Bot tidak akan membalas pesan WhatsApp.
+
+**Solusi untuk masa depan** (tidak mendesak saat ini):
+- **Quick**: set `WEBHOOK_BIND_ADMIN_LOCALHOST=false` + block `/admin/*` lewat reverse proxy (Caddy/nginx).
+- **Cleaner (refactor)**: dua listener terpisah di port berbeda (admin di 127.0.0.1:3001, webhook di 0.0.0.0:3002). Butuh refactor arsitektur.
+- **Detection**: tambah `/healthz` endpoint + alert jika webhook tidak menerima ping dari orchestrator dalam N menit.
+
 ### 6.10.7. Test Results (TASK-056)
 
 **CLI (di DB nyata, mcp_knowledge):**
