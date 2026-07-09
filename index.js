@@ -103,6 +103,20 @@ try {
 let sock;
 const messageCache = {}; // Legacy in-memory ring buffer (per-JID)
 
+// =============================================================================
+// TASK-056 (Fase 6): Mount admin Web UI routes
+// =============================================================================
+// Endpoint: /admin/* (search, stats, delete) — dilindungi ADMIN_TOKEN.
+// Server HARUS di-bind ke 127.0.0.1 saja (lihat app.listen di bawah).
+// =============================================================================
+try {
+  const adminRouter = require('./admin_routes.js');
+  app.use('/admin', adminRouter);
+  console.log('[Init] ✅ Admin Web UI mounted at /admin/* (auth: ADMIN_TOKEN)');
+} catch (e) {
+  console.error('[Init] ❌ Gagal load admin_routes.js:', e.message);
+}
+
 // Endpoint untuk menarik daftar kontak WA
 app.get('/api/contacts', (req, res) => {
   try {
