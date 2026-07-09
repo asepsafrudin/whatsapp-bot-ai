@@ -189,6 +189,40 @@ router.get('/stats', requireAdminToken, async (req, res) => {
       <td>${t.n}</td>
       <td>${esc((t.last_activity instanceof Date) ? t.last_activity.toISOString() : t.last_activity)}</td>
     </tr>`).join('');
+
+    // TASK-057 (Fase 3): Implicit Memory Breakdown untuk top scopes
+    let implicitHTML = '';
+    try {
+      const implicitRows = [];
+      for (const t of stats.top_scopes.slice(0, 5)) {
+        const imps = await store.getImplicitPatterns(t.scope_id, { scopeType: t.scope_type, limit: 1 });
+        if (imps.length > 0) {
+          const imp = imps[0];
+          const md = imp.metadata || {};
+          const peakHour = md.peak_hour_utc !== undefined ? `${md.peak_hour_utc}:00 UTC` : '?';
+          const count = md.interaction_count || '?';
+          const topWords = (md.top_words || []).slice(0, 5).map(w => `${esc(w.word)}(${w.count})`).join(', ') || 'n/a';
+          implicitRows.push(`<tr>
+            <td>${esc(t.scope_type)}:${esc(t.scope_id)}</td>
+            <td>${count}</td>
+            <td>${esc(peakHour)}</td>
+            <td>${topWords}</td>
+          </tr>`);
+        }
+      }
+      if (implicitRows.length > 0) {
+        implicitHTML = `
+<h2>📈 Implicit Memory Breakdown (Fase 3)</h2>
+<p style="font-size:12px;color:#666;">Auto-generated pola interaksi (cron mingguan, TASK-057)</p>
+<table>
+  <tr><th>Scope</th><th>Interaksi</th><th>Peak Hour</th><th>Top 5 Words</th></tr>
+  ${implicitRows.join('')}
+</table>`;
+      }
+    } catch (implicitErr) {
+      console.warn('[admin_routes] ⚠️ Gagal render implicit breakdown:', implicitErr.message);
+      implicitHTML = '<p style="color:#c00;">⚠️ Gagal memuat implicit memory breakdown.</p>';
+    }
     res.send(`<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>Memory Stats</title>
 <style>body{font-family:system-ui,sans-serif;max-width:900px;margin:30px auto;padding:0 20px;}
