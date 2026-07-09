@@ -1,7 +1,7 @@
 # Memory Design — `services/whatsapp-bot-ai/`
 
-> **Task:** TASK-047 (1a) + TASK-048 (1b) + TASK-049 (1c) + TASK-050 (1d) + **TASK-053 (1e)** + **TASK-054 (5)** + **TASK-055 (2)** + **TASK-056 (6)** + **TASK-057 (3)**
-> **Status:** 🟢 COMPLETED (Fase 1a + 1b + 1c + 1d + 1e + **2** + **3** + **5** + **6**)
+> **Task:** TASK-047 (1a) + TASK-048 (1b) + TASK-049 (1c) + TASK-050 (1d) + **TASK-053 (1e)** + **TASK-054 (5)** + **TASK-055 (2)** + **TASK-056 (6)** + **TASK-057 (3)** + **TASK-058 (4)**
+> **Status:** 🟢 COMPLETED (Fase 1a + 1b + 1c + 1d + 1e + **2** + **3** + **4** + **5** + **6**)
 > **Referensi utama:** [`docs/09-proposals/Diagram_Memori_AI_Agent_Revisi.md`](../../docs/09-proposals/Diagram_Memori_AI_Agent_Revisi.md)
 
 ## 1. Tujuan
@@ -976,6 +976,162 @@ cleanup via deleteMemoriesByScope: 9 rows deleted (1 implicit + 8 recent)
 - `tasks/01_active/TASK-057-implicit-memory-fase3/README.md` (task manifest)
 
 
+## 6.12. Integrasi Knowledge Base PUU (Fase 4 — TASK-058)
+
+Per 2026-07-09, **Knowledge Base PUU** sudah terhubung ke bot WhatsApp melalui `search_mcp_knowledge` di `ai-orchestrator`. Berbeda dari Fase 1-3 yang **per-user memory**, Fase 4 adalah **RAG organizational** — bot bisa menjawab pertanyaan regulasi/UU/arsip PUU yang **bukan** dari chat history user, tapi dari knowledge base institusional.
+
+### 6.12.1. Apa yang Berbeda dari Fase Lain
+
+| Aspek | Fase 1-3 (memory) | Fase 4 (KB PUU) |
+|---|---|---|
+| **Scope** | Per-user (`scope_id` = JID) | **Global/organizational** (semua user bisa akses) |
+| **Data source** | Chat history user | **Dokumen PUU ter-embed** (knowledge_documents) |
+| **Vector dim** | `vector(384)` (all-minilm untuk LTM) / `vector(384)` (nomic-embed-text untuk durable) | **`vector(768)` (nomic-embed-text)** |
+| **Trigger** | Otomatis dari chat | **Auto oleh LLM** saat pertanyaan regulasi/PUU terdeteksi |
+| **Use case** | Personalisasi & recall | **Q&A regulasi, arsip, SOP** |
+| **Authoritative** | User punya kontrol penuh (Fase 6 GDPR) | **Shared read-only** (semua role) |
+| **Update flow** | Real-time (chat) + cron (implicit/durable) | **Ingest manual/on-demand** oleh pipeline pusat-korespondensi |
+
+### 6.12.2. Skema Database — TIDAK Berubah
+
+Fase 4 **tidak butuh schema baru** — pakai `public.knowledge_documents` yang sudah ada:
+
+```sql
+-- Sudah ada (sebelum TASK-058) di schema public:
+CREATE TABLE knowledge_documents (
+    id          TEXT PRIMARY KEY,
+    content     TEXT NOT NULL,
+    embedding   VECTOR(768),                 -- nomic-embed-text
+    metadata    JSONB DEFAULT '{}',
+    namespace   TEXT DEFAULT 'default',
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_knowledge_documents_hnsw ON knowledge_documents USING hnsw (embedding vector_cosine_ops);
+```
+
+**Isi KB per 2026-07-09** (4500 row, 4481 dengan embedding, 9 namespace):
+
+| Namespace | Rows | Tahun | Keterangan |
+|---|---|---|---|
+| `legal_regulations` | 408 | 2014 | **UU 23/2014 Pemerintahan Daerah** (pasal-demi-pasal) |
+| `arsip_knowledge` | 611 | 2025 | **Arsip surat masuk PUU 2025** (kode surat, no surat, OCR + ringkasan AI) |
+| `docs_rag` | 1024 | — | Dokumentasi internal MCP/operasional |
+| `archive_2025` | 2382 | 2025 | Arsip 2025 (sumber lain) |
+| `surat_masuk` | 2 | — | Sample kecil |
+| `chat_memory_*`, `chat_history` | 47 | — | LTM/chat legacy (auto-generated) |
+| `mcp-format-standard` | 7 | — | Format standard MCP |
+| `abstraction/mcp-unified` | 19 (no emb) | — | Hasil LLM abstraction (audit token efficiency) |
+
+### 6.12.3. Tool: `search_mcp_knowledge(query, namespace="")` di `mcp_tools.py`
+
+TASK-058 **memperkuat** tool yang sudah ada dengan:
+
+1. **Parameter `namespace` opsional** — filter ke namespace spesifik atau kosong=semua.
+2. **Sitasi lengkap** — Judul, Pasal, Jenis, Tahun, Namespace, File.
+3. **Limit 3 → 5 dokumen** — pertanyaan regulasi butuh konteks lebih.
+4. **Preview 500 → 800 char** — pasal UU biasanya panjang.
+5. **Docstring lebih eksplisit** — auto-trigger LLM untuk pertanyaan regulasi/PUU/UU.
+
+```python
+@tool
+def search_mcp_knowledge(query: str, namespace: str = "") -> str:
+    """
+    Mencari dokumen, aturan (PUU), arsip, dan SOP dari dalam database MCP Knowledge Base.
+
+    Gunakan alat ini setiap kali pengguna bertanya tentang:
+    - Kebijakan, aturan, regulasi, atau perundang-undangan (UU, Peraturan Pemerintah, Perda, dll)
+    - Dokumen hukum tertentu (mis. "UU 23 Tahun 2014", "Pasal 1 ayat 2")
+    - Prosedur administrasi desa/pemda
+    - Surat masuk / arsip / disposisi PUU
+    - SOP internal
+    - Aturan/pedoman dari Kementerian/Lembaga
+
+    Args:
+        query: Pertanyaan atau kata kunci pencarian
+        namespace: Opsional. "legal_regulations" | "arsip_knowledge" | "docs_rag" | "" (semua)
+    """
+```
+
+### 6.12.4. Alur (Fase 4)
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│ WhatsApp (Baileys) — User chat                                   │
+│ "Bot, jelaskan kewenangan desa berdasarkan UU 23"                │
+└─────────────────┬────────────────────────────────────────────────┘
+                  │ messages.upsert
+                  ▼
+┌──────────────────────────────────────────────────────────────────┐
+│ whatsapp-bot-ai (Node.js) — tidak berubah                       │
+│  1. memoryRouter.selectMemoryStores (Fase 1b)                    │
+│  2. saveMessage(recent)                                          │
+│  3. axios POST /api/v1/chat { history }                          │
+└─────────────────┬────────────────────────────────────────────────┘
+                  │
+                  ▼
+┌──────────────────────────────────────────────────────────────────┐
+│ ai-orchestrator (graph.py)                                       │
+│  1. LLM (llama-3.3-70b) lihat history + pesan baru              │
+│  2. LLM detect "ini pertanyaan regulasi" → panggil tool:         │
+│     search_mcp_knowledge("kewenangan desa", "legal_regulations") │
+│  3. Tool generate embedding via Ollama (nomic-embed-text 768)     │
+│  4. Tool query ke public.knowledge_documents dengan              │
+│     WHERE namespace = 'legal_regulations'                        │
+│       AND 1 - (embedding <=> $1::vector) >= 0.6                  │
+│     ORDER BY embedding <=> $1::vector LIMIT 5                    │
+│  5. Return 5 pasal relevan + sitasi lengkap                      │
+│  6. LLM synthesize jawaban + sitasi pasal ke user                │
+└─────────────────┬────────────────────────────────────────────────┘
+                  │
+                  ▼
+┌──────────────────────────────────────────────────────────────────┐
+│ Webhook /webhook/whatsapp → bot kirim jawaban ke user WA         │
+│ Jawaban: "Berdasarkan UU 23/2014 Pasal X ayat Y: [kutipan]..."   │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### 6.12.5. Test Results (TASK-058)
+
+| Test | Query | Namespace | Hasil |
+|---|---|---|---|
+| 1 | "kewenangan desa" | (semua) | ✅ 5 referensi dari `docs_rag` (Bab 8, 4 UU 23/2014) |
+| 2 | "UU 23 Pasal 1" | `legal_regulations` | ✅ 5 pasal UU 23/2014, sitasi lengkap (Judul, Pasal, Jenis, Tahun) |
+| 3 | "cryptocurrency mining" | `legal_regulations` | ✅ Empty result + pesan jelas "tidak ditemukan" |
+| 4 | "permohonan JKN non asn PPPK" | `arsip_knowledge` | ⚠️ Empty (similarity rendah untuk query spesifik) |
+| 5 | "korespondensi permohonan" | `arsip_knowledge` | ✅ 5 arsip surat 2025, sitasi (Kode Surat 1681/L, 0247/L, dll) |
+
+**Catatan**: Tool ini **sudah ter-ekspos** ke LLM di `graph.py` line 221 (default tools list, semua role — bukan superadmin-only). Bot akan auto-trigger saat pertanyaan regulasi/PUU terdeteksi.
+
+### 6.12.6. Limitasi Fase 4 (Sengaja)
+
+- ⏳ **Ingestion masih manual** — pipeline `pusat-korespondensi` (parser + OCR + embedding) dijalankan terpisah, bukan via chat. User harus trigger `sync_knowledge_to_ltm.py` atau pipeline ingest sendiri untuk tambah dokumen baru.
+- ⏳ **Tidak ada feedback loop** — belum ada mekanisme untuk user kasih rating "jawaban ini relevan" atau "tidak relevan" untuk improve retrieval quality.
+- ⏳ **Cross-namespace search belum paralel** — sekarang hanya single namespace per call. Kalau mau cari di 2 namespace (mis. legal_regulations + arsip_knowledge sekaligus), perlu 2x call.
+- ⏳ **Tidak ada filter tahun/jenis di tool** — kalau user mau "UU 23 Pasal 1 Tahun 2014 saja", LLM harus query `legal_regulations` dan LLM sendiri yang filter tahun dari hasil.
+- ⏳ **Similarity threshold 0.6 fixed** — tidak ada mekanisme auto-tune per query type. Query spesifik (Test 4) bisa gagal karena threshold terlalu tinggi.
+- ⏳ **Tidak ada chunked answer** — kalau pasal panjang > 800 char, cuma 800 char pertama yang dikasih ke LLM. Pasal panjang bisa terpotong.
+
+### 6.12.7. File yang Diubah (Fase 4 — TASK-058)
+
+- `services/ai-orchestrator/mcp_tools.py` (MODIFIED) — `search_mcp_knowledge()` + parameter `namespace` opsional, sitasi lengkap, limit 3→5, preview 500→800, docstring diperkuat
+- `services/whatsapp-bot-ai/MEMORY_DESIGN.md` (MODIFIED) — section 6.12 (Fase 4) + roadmap updated
+
+**TIDAK ADA perubahan di** `services/whatsapp-bot-ai/` (kecuali dokumentasi). Bot tetap jalur pipa biasa, semua kerja di `ai-orchestrator/`.
+
+### 6.12.8. Risiko yang Sudah Di-mitigasi (per concern user 2026-07-09)
+
+User khawatir: *"Kalau ternyata model embedding dokumen PUU beda dengan yang dipakai untuk query, maka pencarian similarity akan menghasilkan hasil yang tidak relevan tanpa error yang jelas"*.
+
+**Mitigasi yang sudah ada** (sebelum TASK-058):
+- Dimensi embedding di `knowledge_documents` (vector(768)) **seragam** untuk semua 4481 row yang punya embedding (Test 0 discovery: `vector_dims(embedding) = 768` untuk semua).
+- `generate_embedding()` di `mcp_tools.py` line 14 pakai `EMBEDDING_MODEL=nomic-embed-text` (768-dim) — **konsisten** dengan yang dipakai saat ingest dokumen PUU (pipeline pusat-korespondensi).
+- Risiko dimensi mismatch (yang sempat jadi bug Fase 2 commit `42b86e7` untuk LTM 384-dim) **TIDAK berlaku** untuk Fase 4 — vector space konsisten.
+- Risiko model embedding beda (mis. ingest pakai model A, query pakai model B) **sudah di-test** di Test 1-5 — semua return hasil relevan untuk query yang sesuai (Test 1-2, 5) atau empty result dengan pesan jelas (Test 3) — bukan "no error tapi hasil ngaco".
+
+**Backup safety net**: jika Fase 4 deploy menyebabkan hasil search tidak relevan, rollback commit `639d4ad` di monorepo `mcp-universal-agent-system` untuk revert ke versi tool lama (limit 3, tanpa namespace, format "Sumber:" bukan "Sitasi:").
+
+---
+
 ## 7. Limitasi Fase 1a + 1b + 1c + 1d + 1e + 5 (Sengaja Ditunda)
 
 - ❌ **Profile, Explicit, Durable, Implicit memory belum ada** — hanya `recent` yang aktif.
@@ -995,7 +1151,7 @@ cleanup via deleteMemoriesByScope: 9 rows deleted (1 implicit + 8 recent)
 | **5** | Explicit memory (`!ingat key: value` / `!lupa` / `!profile` / `!memory`) + durable storage + indexes | ✅ COMPLETED (TASK-054) |
 | **2** | Endpoint `/api/v1/memory/extract` di ai-orchestrator; ConsolidationJob (similarity check, merge, versioning) | ✅ COMPLETED (TASK-055) |
 | **3** | Implicit memory (auto-extract pola interaksi — jam aktif + topik) | ✅ COMPLETED (TASK-057) |
-| **4** | Durable memory + semantic search (pgvector) + integrasi knowledge base PUU | ⏳ BACKLOG |
+| **4** | Integrasi Knowledge Base PUU via `search_mcp_knowledge` (RAG organizational, vector(768) HNSW) | ✅ COMPLETED (TASK-058) |
 | **5** | Explicit memory (`!ingat ...`); Profile memory (preferensi user) | ⏳ BACKLOG |
 | **6** | Admin UI / CLI untuk lihat, hapus, export memori | ✅ COMPLETED (TASK-056) |
 
