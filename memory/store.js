@@ -969,6 +969,9 @@ module.exports = {
   formatEmbeddingForDB,
   detectHasVector,
   hasEmbeddingColumn,
+  // DB lifecycle (TASK-056 Fase 6 — dipakai CLI)
+  isReady: db.isReady,
+  close: db.close,
   // Constants
   RETENTION_DAYS,
   DEFAULT_LIMIT,
