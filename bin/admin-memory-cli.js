@@ -157,6 +157,23 @@ async function cmdStats(args) {
   });
   console.log(`\n📊 Memory Stats${args.scopeType ? ' (scope_type=' + args.scopeType + ')' : ' (global)'}`);
   console.log(fmtStats(result));
+
+  // TASK-057 (Fase 3): Tampilkan implicit breakdown jika ada
+  if (result && result.top_scopes && result.top_scopes.length > 0) {
+    console.log(`\n  📈 Implicit Memory Breakdown (per top scope):`);
+    for (const t of result.top_scopes.slice(0, 3)) {  // top 3 saja
+      const imps = await store.getImplicitPatterns(t.scope_id, { scopeType: t.scope_type, limit: 1 });
+      if (imps.length > 0) {
+        const imp = imps[0];
+        const md = imp.metadata || {};
+        const peakHour = md.peak_hour_utc !== undefined ? `${md.peak_hour_utc}:00 UTC` : '?';
+        const count = md.interaction_count || '?';
+        const topWords = (md.top_words || []).slice(0, 5).map(w => `${w.word}(${w.count})`).join(', ');
+        console.log(`    - ${t.scope_type}:${t.scope_id}`);
+        console.log(`      last implicit: ${count} interaksi, peak=${peakHour}, top=${topWords || 'n/a'}`);
+      }
+    }
+  }
   await store.close();
 }
 

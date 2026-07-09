@@ -218,6 +218,7 @@ th{background:#f0f0f0;}
   <tr><th>Type</th><th>Scope ID</th><th>Rows</th><th>Last Activity</th></tr>
   ${topRows}
 </table>
+${implicitHTML}
 <p style="margin-top:20px;font-size:11px;color:#666;">Generated at: ${esc(stats.generated_at)}</p>
 </body></html>`);
   } catch (e) {
