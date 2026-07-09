@@ -746,6 +746,198 @@ async function runConsolidationJob(opts = {}) {
   return { scanned, merged, errors, duration_ms: duration };
 }
 
+// =============================================================================
+// TASK-056 (Fase 6): Admin API untuk inspeksi & GDPR delete
+// =============================================================================
+// Dipakai oleh CLI (`bin/admin-memory-cli.js`) dan Web UI (`admin_routes.js`).
+// - searchMemoriesByScope: list semua memory per user, filter per memory_type
+// - getMemoryStats: count per type, growth 7/30 hari, oldest/newest, per scope
+// - deleteMemoriesByScope: HARD delete (GDPR) — bukan soft-delete seperti Fase 2
+// =============================================================================
+
+/**
+ * Cari semua memory untuk satu scope (untuk CLI `search` & Web UI `/admin/search`).
+ *
+ * @param {string} scopeId   e.g. '628xxx@s.whatsapp.net' atau '123@g.us'
+ * @param {object} [opts]
+ * @param {string} [opts.scopeType='personal']   'personal' | 'group'
+ * @param {string[]} [opts.memoryTypes=null]   filter ke subset; null = semua
+ * @param {boolean} [opts.includeExpired=false]   jika true, termasuk row expires_at <= NOW()
+ * @param {number} [opts.limit=100]
+ * @returns {Promise<{count, byType, rows}>}
+ */
+async function searchMemoriesByScope(scopeId, opts = {}) {
+  const {
+    scopeType = 'personal',
+    memoryTypes = null,
+    includeExpired = false,
+    limit = 100,
+  } = opts;
+  if (!scopeId) {
+    throw new Error('[memory/store] searchMemoriesByScope: scopeId wajib diisi');
+  }
+  const expiryFilter = includeExpired ? 'TRUE' : '(expires_at IS NULL OR expires_at > NOW())';
+  const params = [scopeType, scopeId];
+  let typeFilter = '';
+  if (memoryTypes && memoryTypes.length > 0) {
+    params.push(memoryTypes);
+    typeFilter = `AND memory_type = ANY($${params.length}::text[])`;
+  }
+  params.push(limit);
+  const sql = `
+    SELECT id, scope_type, scope_id, memory_type, role, content, source,
+           confidence_score, version, metadata, external_message_id,
+           consolidated_at, source_memory_ids, expires_at,
+           created_at, updated_at
+    FROM whatsapp_bot.memories
+    WHERE scope_type = $1 AND scope_id = $2
+      AND ${expiryFilter}
+      ${typeFilter}
+    ORDER BY created_at DESC
+    LIMIT $${params.length}
+  `;
+  try {
+    const { rows } = await db.query(sql, params);
+    const byType = rows.reduce((acc, r) => {
+      acc[r.memory_type] = (acc[r.memory_type] || 0) + 1;
+      return acc;
+    }, {});
+    return { count: rows.length, byType, rows };
+  } catch (err) {
+    console.error('[memory/store] ❌ searchMemoriesByScope error:', err.message);
+    return { count: 0, byType: {}, rows: [] };
+  }
+}
+
+/**
+ * Statistik memory (untuk CLI `stats` & Web UI `/admin/stats`).
+ *
+ * @param {object} [opts]
+ * @param {string} [opts.scopeType=null]   null = semua
+ * @returns {Promise<object>}
+ */
+async function getMemoryStats(opts = {}) {
+  const { scopeType = null } = opts;
+  try {
+    const typeParams = [];
+    let typeScopeFilter = '';
+    if (scopeType) {
+      typeParams.push(scopeType);
+      typeScopeFilter = `WHERE scope_type = $1`;
+    }
+    const byTypeSql = `
+      SELECT memory_type, COUNT(*)::int AS n
+      FROM whatsapp_bot.memories
+      ${typeScopeFilter}
+      GROUP BY memory_type
+      ORDER BY n DESC
+    `;
+    const { rows: typeRows } = await db.query(byTypeSql, typeParams);
+    const byType = {};
+    for (const r of typeRows) byType[r.memory_type] = r.n;
+    const total = typeRows.reduce((sum, r) => sum + r.n, 0);
+
+    const oldestNewestParams = [];
+    let onScopeFilter = '';
+    if (scopeType) {
+      oldestNewestParams.push(scopeType);
+      onScopeFilter = `WHERE scope_type = $1`;
+    }
+    const onSql = `SELECT MIN(created_at) AS oldest, MAX(created_at) AS newest FROM whatsapp_bot.memories ${onScopeFilter}`;
+    const { rows: onRows } = await db.query(onSql, oldestNewestParams);
+
+    const growthParams = [];
+    let growthScopeFilter = '';
+    if (scopeType) {
+      growthParams.push(scopeType);
+      growthScopeFilter = `AND scope_type = $1`;
+    }
+    const growthSql = `
+      SELECT
+        COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '7 days')::int AS last_7d,
+        COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '30 days')::int AS last_30d,
+        COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '1 day')::int AS last_1d
+      FROM whatsapp_bot.memories
+      WHERE 1=1 ${growthScopeFilter}
+    `;
+    const { rows: growthRows } = await db.query(growthSql, growthParams);
+
+    const topScopeParams = [];
+    let topScopeFilter = '';
+    if (scopeType) {
+      topScopeParams.push(scopeType);
+      topScopeFilter = `WHERE scope_type = $1`;
+    }
+    const topScopeSql = `
+      SELECT scope_type, scope_id, COUNT(*)::int AS n, MAX(created_at) AS last_activity
+      FROM whatsapp_bot.memories
+      ${topScopeFilter}
+      GROUP BY scope_type, scope_id
+      ORDER BY n DESC
+      LIMIT 10
+    `;
+    const { rows: topScopeRows } = await db.query(topScopeSql, topScopeParams);
+
+    return {
+      total,
+      byType,
+      oldest: onRows[0].oldest,
+      newest: onRows[0].newest,
+      growth: {
+        last_1d: growthRows[0].last_1d,
+        last_7d: growthRows[0].last_7d,
+        last_30d: growthRows[0].last_30d,
+      },
+      top_scopes: topScopeRows,
+      generated_at: new Date().toISOString(),
+    };
+  } catch (err) {
+    console.error('[memory/store] ❌ getMemoryStats error:', err.message);
+    return null;
+  }
+}
+
+/**
+ * HARD delete semua memory untuk satu scope (GDPR right-to-be-forgotten).
+ *
+ * @param {string} scopeId
+ * @param {object} [opts]
+ * @param {string} [opts.scopeType='personal']
+ * @param {string[]} [opts.memoryTypes=null]   filter ke subset; null = semua
+ * @returns {Promise<{deleted_count, byType}>}
+ */
+async function deleteMemoriesByScope(scopeId, opts = {}) {
+  const { scopeType = 'personal', memoryTypes = null } = opts;
+  if (!scopeId) {
+    throw new Error('[memory/store] deleteMemoriesByScope: scopeId wajib diisi');
+  }
+  const params = [scopeType, scopeId];
+  let typeFilter = '';
+  if (memoryTypes && memoryTypes.length > 0) {
+    params.push(memoryTypes);
+    typeFilter = `AND memory_type = ANY($${params.length}::text[])`;
+  }
+  const sql = `
+    DELETE FROM whatsapp_bot.memories
+    WHERE scope_type = $1 AND scope_id = $2 ${typeFilter}
+    RETURNING memory_type
+  `;
+  try {
+    const { rows } = await db.query(sql, params);
+    const byType = rows.reduce((acc, r) => {
+      acc[r.memory_type] = (acc[r.memory_type] || 0) + 1;
+      return acc;
+    }, {});
+    console.log(
+      `[memory/store] 🗑️  GDPR delete: ${rows.length} rows from ${scopeType}:${scopeId} (${JSON.stringify(byType)})`
+    );
+    return { deleted_count: rows.length, byType };
+  } catch (err) {
+    console.error('[memory/store] ❌ deleteMemoriesByScope error:', err.message);
+    throw err;
+  }
+}
+
 module.exports = {
   // Fase 1a-1d
   saveMessage,
@@ -768,6 +960,10 @@ module.exports = {
   mergeDurableMemories,
   markConsolidated,
   runConsolidationJob,
+  // TASK-056 (Fase 6) - Admin API
+  searchMemoriesByScope,
+  getMemoryStats,
+  deleteMemoriesByScope,
   // Helpers (Fase 2 bugfix)
   parseEmbedding,
   formatEmbeddingForDB,
