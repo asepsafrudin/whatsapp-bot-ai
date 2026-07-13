@@ -1,9 +1,12 @@
-# WhatsApp AI Bot (Baileys + ai-orchestrator)
+# WhatsApp AI Bot (Production-Ready Memory & Admin Layer)
 
-Bot WhatsApp **unofficial** (Baileys — reverse-engineered WhatsApp Web) yang
-menjawab pesan lewat **ai-orchestrator** (FastAPI + LangGraph) sebagai otak
-LLM-nya, dengan **memori percakapan persistent ke PostgreSQL** dan
-**sinkronisasi kontak** terpusat ke `public.member_profiles`.
+Repositori ini bukan sekadar gateway WhatsApp biasa. Ini adalah **sistem backend terskala** yang menggabungkan WhatsApp Web (Baileys), **memori AI jangka panjang berbasis PostgreSQL**, dan panel administrasi terpadu.
+
+Fitur Utama:
+- **Integrasi LLM:** Meneruskan pesan ke **ai-orchestrator** (FastAPI + LangGraph) sebagai otak utamanya.
+- **Durable Memory Layer (PostgreSQL):** Penyimpanan riwayat chat, ekstraksi pola implisit (cron otomatis), memori eksplisit (commands), dan integrasi pencarian semantik (pgvector).
+- **Admin Panel (Web UI):** Menyediakan endpoint `/admin/*` untuk inspeksi data memori, statistik metrik, serta _hard-delete_ untuk kepatuhan GDPR (dilengkapi proteksi rate-limiting & timing attack).
+- **Real-Time Contacts Sync:** Sinkronisasi kontak dinamis (`contacts.upsert`) yang tidak memblokir event loop menuju tabel `public.member_profiles`.
 
 > **Dokumentasi detail tentang memori**: lihat [`MEMORY_DESIGN.md`](./MEMORY_DESIGN.md)
 > (arsitektur memory, schema DB, fase 1a-1e+5, alur data end-to-end).
@@ -29,15 +32,15 @@ LLM-nya, dengan **memori percakapan persistent ke PostgreSQL** dan
 ┌──────────────────┐  messages.upsert   ┌──────────────────────────────────────┐
 │  WhatsApp (HP)   │ ─────────────────▶ │  whatsapp-bot-ai (Baileys, Node.js)  │
 │  via QR pairing  │                    │  ├─ index.js       (chat handler)    │
-└──────────────────┘                    │  ├─ memory/router (select stores)    │
-                                        │  ├─ memory/store  (CRUD postgres)   │
-┌──────────────────┐  webhook           │  └─ briefing.js   (cron pagi)        │
-│  ai-orchestrator │ ◀───────────────── │       │                              │
-│  (FastAPI)       │                    └───────┼──────────────────────────────┘
-│  /api/v1/chat    │                            │
-│  /api/v1/briefing│                            ▼
-└────────┬─────────┘                    ┌──────────────────────────┐
-         │                              │  PostgreSQL              │
+└──────────────────┘                    │  ├─ memory/router  (select stores)   │
+                                        │  ├─ memory/store   (CRUD postgres)   │
+┌──────────────────┐  webhook           │  ├─ admin_routes.js(Admin Dashboard) │
+│  ai-orchestrator │ ◀───────────────── │  └─ briefing.js    (cron pagi)       │
+│  (FastAPI)       │                    └───────┼───────────────────┬──────────┘
+│  /api/v1/chat    │                            │                   │
+│  /api/v1/briefing│                            ▼                   ▼
+└────────┬─────────┘                    ┌──────────────────────────┐  Admin UI
+         │                              │  PostgreSQL              │ (localhost)
          │ history (10 turns)           │  ├─ whatsapp_bot.memories│
          ▼                              │  └─ public.member_profiles│
    LLM (Groq / OpenAI)                 └──────────────────────────┘
@@ -54,7 +57,8 @@ PostgreSQL terpusat.
 
 ```
 services/whatsapp-bot-ai/
-├── index.js                # Entry point: Baileys sock + Express webhook + cron
+├── index.js                # Entry point: Baileys sock + Express webhook + cron scheduling
+├── admin_routes.js         # Endpoint dashboard admin web (/admin/*) dengan rate limiting
 ├── briefing.js             # Modul trigger briefing pagi ke ai-orchestrator
 ├── package.json            # Dependensi Node.js
 ├── .env.example            # Template env (salin jadi .env, lihat config/env/)
@@ -321,9 +325,9 @@ orchestrator untuk konfigurasi Groq / OpenAI / model lain.
 | 1e | ✅ | DB-first contacts (`member_profiles`) + `sync_contacts` tool |
 | 5  | ✅ | Commands `!ingat` / `!lupa` / `!profile` / `!memory` |
 | 2  | ✅ | **Durable memory** + **ConsolidationJob** + `/api/v1/memory/extract` + `pgvector` semantic search |
-| 3  | ⏳ | Implicit memory (async batch) |
-| 4  | ⏳ | Durable memory + semantic search (pgvector) |
-| 6  | ⏳ | Admin UI / CLI untuk lihat, hapus, export memory |
+| 3  | ✅ | Implicit memory (async batch via scheduler di index.js) |
+| 4  | ✅ | Durable memory + semantic search (pgvector - TASK-055) |
+| 6  | ✅ | Admin UI Express Web Route (`admin_routes.js`) dengan auth token |
 
 Detail roadmap + status per fase: [MEMORY_DESIGN.md § 8](./MEMORY_DESIGN.md#8-roadmap).
 
