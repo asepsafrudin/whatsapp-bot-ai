@@ -48,12 +48,10 @@ CREATE INDEX IF NOT EXISTS idx_memories_expires
     ON whatsapp_bot.memories (expires_at)
     WHERE expires_at IS NOT NULL;
 
--- Index untuk ConsolidationJob (fase berikutnya): placeholder
--- TODO Fase 2: redesign index ini untuk semantic search (pgvector/hnsw atau tsvector/GIN)
--- untuk saat ini hanya berguna untuk exact-match filter memory_type='durable'.
+-- Index untuk ConsolidationJob: menggunakan HNSW untuk semantic search (Fase 2)
 CREATE INDEX IF NOT EXISTS idx_memories_durable_scope
-    ON whatsapp_bot.memories (scope_type, scope_id, memory_type)
-    WHERE memory_type = 'durable';
+    ON whatsapp_bot.memories USING hnsw (embedding vector_cosine_ops)
+    WHERE memory_type = 'durable' AND embedding IS NOT NULL;
 
 -- TASK-049: Unique partial index untuk dedup berdasarkan external_message_id
 CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_dedup

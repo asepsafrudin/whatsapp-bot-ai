@@ -16,6 +16,7 @@ const memoryStore = require('./memory/store');
 const memoryRouter = require('./memory/router');
 // TASK-053: DB pool untuk contacts.upsert real-time → public.member_profiles
 const memoryDb = require('./memory/db');
+const { formatToWhatsApp } = require('./formatter');
 
 // Konfigurasi API
 const FASTAPI_URL = process.env.FASTAPI_URL || 'http://localhost:8001/api/v1/chat';
@@ -23,7 +24,7 @@ const WEBHOOK_PORT = process.env.WEBHOOK_PORT || 3001;
 const WEBHOOK_HOST = process.env.WEBHOOK_HOST || 'http://localhost:3001';
 
 // Helper: baca WEBHOOK_SECRET dengan fallback MCP_WEBHOOK_SECRET (TASK-051)
-const WEBHOOK_SECRET = process.env.MCP_WEBHOOK_SECRET || WEBHOOK_SECRET;
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || process.env.MCP_WEBHOOK_SECRET;
 if (!WEBHOOK_SECRET) {
   console.error('[Init] ❌ FATAL: WEBHOOK_SECRET / MCP_WEBHOOK_SECRET tidak diset di env.');
   console.error('[Init] Cek /home/aseps/MCP/config/env/.env.core atau .env.messaging');
@@ -125,7 +126,7 @@ try {
 }
 
 let sock;
-const messageCache = {}; // Legacy in-memory ring buffer (per-JID)
+let cronBriefing, cronPurge, cronConsolidasi, cronImplicit, cronImplicitPurge;
 
 // =============================================================================
 // TASK-056 (Fase 6): Mount admin Web UI routes
@@ -194,12 +195,24 @@ app.post('/webhook/whatsapp', async (req, res) => {
       return res.status(403).json({ error: "Forbidden: Invalid Webhook Secret" });
     }
 
-    const { user_id, response, request_id } = req.body;  // TASK-050: terima request_id
+    const { user_id, response, request_id, sender_id } = req.body;  // TASK-050: terima request_id
     console.log(`[Webhook] Menerima balasan untuk: ${user_id} (request_id=${request_id || 'none'})`);
 
     if (sock && user_id && response) {
+      // Format respon agar kompatibel dan maksimal di WhatsApp
+      const formattedResponse = formatToWhatsApp(response);
+      
+      const sendOptions = {};
+      let finalResponse = formattedResponse;
+      if (typeof user_id === 'string' && user_id.endsWith('@g.us') && sender_id) {
+        sendOptions.mentions = [sender_id];
+        const senderPhone = sender_id.split('@')[0];
+        finalResponse = `@${senderPhone}\n\n${formattedResponse}`;
+      }
+      sendOptions.text = finalResponse;
+
       // Kirim balasan ke WhatsApp
-      await sock.sendMessage(user_id, { text: response });
+      await sock.sendMessage(user_id, sendOptions);
       res.status(200).json({ success: true });
 
       // ========== TASK-048 Fase 1b + TASK-050 Fase 1d: Simpan assistant response ==========
@@ -252,17 +265,23 @@ app.get('/api/group/:group_id/members', async (req, res) => {
   }
 });
 
-app.get('/api/group/:group_id/messages', (req, res) => {
+app.get('/api/group/:group_id/messages', async (req, res) => {
   const groupId = req.params.group_id;
   const limit = parseInt(req.query.limit) || 20;
 
-  if (!messageCache[groupId]) {
-      return res.status(200).json({ messages: [] });
+  try {
+    const scopeType = groupId.endsWith('@g.us') ? 'group' : 'user';
+    const msgs = await memoryStore.getAllRecentTurns(scopeType, groupId, limit);
+    const formatted = msgs.map(m => ({
+      sender: m.role === 'assistant' ? 'Bot' : (m.metadata?.sender_id || groupId),
+      text: m.content,
+      time: m.created_at
+    }));
+    res.status(200).json({ messages: formatted });
+  } catch (err) {
+    console.error("[API Error] Gagal membaca pesan dari DB:", err.message);
+    res.status(500).json({ error: err.message });
   }
-
-  const msgs = messageCache[groupId];
-  const sliced = msgs.slice(Math.max(msgs.length - limit, 0));
-  res.status(200).json({ messages: sliced });
 });
 
 // Bind host — lihat BIND_ADMIN_LOCALHOST di atas.
@@ -386,7 +405,10 @@ async function startBot() {
         waContacts[c.id] = c;
       }
     }
-    fs.writeFileSync('./wa_contacts.json', JSON.stringify(waContacts, null, 2));
+    const fs = require('fs');
+    fs.writeFile('./wa_contacts.json', JSON.stringify(waContacts, null, 2), (err) => {
+      if (err) console.error('[Contacts] Gagal save wa_contacts.json (async):', err.message);
+    });
 
     // ===== TASK-053: Real-time DB upsert (fire-and-forget) =====
     // Sinkron ke public.member_profiles. Tidak await — user latency tidak boleh terganggu.
@@ -425,7 +447,8 @@ async function startBot() {
       const BRIEFING_CRON = process.env.BRIEFING_CRON || '0 8 * * 1-5';
       console.log(`[Briefing] Menjadwalkan briefing pagi: cron="${BRIEFING_CRON}" ke grup ${process.env.BRIEFING_GROUP_JID || '120363426109888899@g.us'}`);
 
-      cron.schedule(BRIEFING_CRON, () => {
+      if (cronBriefing) cronBriefing.stop();
+      cronBriefing = cron.schedule(BRIEFING_CRON, () => {
         console.log('[Briefing] Trigger jadwal briefing!');
         briefing.sendBriefing(sock).then(result => {
           if (result.success) {
@@ -440,7 +463,8 @@ async function startBot() {
 
       // ===== SCHEDULER PURGE MEMORY EXPIRED (TASK-047) =====
       const PURGE_CRON = process.env.WHATSAPP_MEMORY_PURGE_CRON || '0 3 * * *';
-      cron.schedule(PURGE_CRON, () => {
+      if (cronPurge) cronPurge.stop();
+      cronPurge = cron.schedule(PURGE_CRON, () => {
         console.log('[Memory] Trigger purge expired memories...');
         memoryStore.purgeExpired().catch(err =>
           console.error('[Memory] Purge job error:', err.message)
@@ -451,7 +475,8 @@ async function startBot() {
       // Setiap jam 04:00 WIB, jalankan runConsolidationJob() untuk scan
       // durable memory yang belum di-consolidate, similarity check, dan merge.
       const CONSOLIDATION_CRON = process.env.WHATSAPP_MEMORY_CONSOLIDATION_CRON || '0 4 * * *';
-      cron.schedule(CONSOLIDATION_CRON, () => {
+      if (cronConsolidasi) cronConsolidasi.stop();
+      cronConsolidasi = cron.schedule(CONSOLIDATION_CRON, () => {
         console.log('[Memory] 🧠 Trigger ConsolidationJob (Fase 2)...');
         memoryStore.runConsolidationJob({
           batchSize: parseInt(process.env.WHATSAPP_MEMORY_CONSOLIDATION_BATCH || '50', 10),
@@ -469,7 +494,8 @@ async function startBot() {
       // dan simpan sebagai memory_type='implicit' (soft-delete 90 hari).
       const IMPLICIT_CRON = process.env.WHATSAPP_MEMORY_IMPLICIT_CRON || '0 2 * * 0';
       console.log(`[Memory] ImplicitAggregate dijadwalkan: cron="${IMPLICIT_CRON}" (timezone Asia/Jakarta)`);
-      cron.schedule(IMPLICIT_CRON, () => {
+      if (cronImplicit) cronImplicit.stop();
+      cronImplicit = cron.schedule(IMPLICIT_CRON, () => {
         console.log('[Memory] 🧠 Trigger ImplicitAggregate (Fase 3)...');
         memoryStore.aggregateImplicitPatterns({
           minInteractions: parseInt(process.env.WHATSAPP_MEMORY_IMPLICIT_MIN_INTERACTIONS || '5', 10),
@@ -486,7 +512,8 @@ async function startBot() {
       // Setiap jam 03:30 WIB, hapus implicit memory yang sudah expire.
       // (Sama jadwalnya dengan purge recent, tapi beda filter memory_type.)
       const IMPLICIT_PURGE_CRON = process.env.WHATSAPP_MEMORY_IMPLICIT_PURGE_CRON || '30 3 * * *';
-      cron.schedule(IMPLICIT_PURGE_CRON, () => {
+      if (cronImplicitPurge) cronImplicitPurge.stop();
+      cronImplicitPurge = cron.schedule(IMPLICIT_PURGE_CRON, () => {
         console.log('[Memory] 🧹 Trigger implicit purge (Fase 3)...');
         memoryStore.purgeImplicitOlderThan(0).then((r) => {
           if (r.deleted_count > 0) console.log(`[Memory] 🧹 Implicit purged: ${r.deleted_count}`);
@@ -596,20 +623,7 @@ async function startBot() {
       });
     }
 
-    // --- Legacy Message Caching (ring buffer per-JID) ---
-    if (!messageCache[remoteJid]) {
-      messageCache[remoteJid] = [];
-    }
-    const sender_cid = msg.key.participant || msg.key.remoteJid;
-    messageCache[remoteJid].push({
-      sender: isFromMe ? "Bot" : sender_cid,
-      text: text,
-      time: new Date().toISOString()
-    });
-    if (messageCache[remoteJid].length > 100) {
-      messageCache[remoteJid].shift();
-    }
-    // -----------------------------------------------------------------------
+    // --- Legacy Message Caching removed (moved to memoryStore) ---
 
     console.log(`📩 [DEBUG] Pesan masuk dari ${remoteJid}: "${text}" (request_id=${requestId})`);
 

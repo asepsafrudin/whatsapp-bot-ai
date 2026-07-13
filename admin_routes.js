@@ -22,13 +22,34 @@
 const express = require('express');
 const store = require('./memory/store.js');
 
-const ADMIN_TOKEN = process.env.ADMIN_TOKEN || process.env.MCP_ADMIN_TOKEN || null;
+let ADMIN_TOKEN = process.env.ADMIN_TOKEN || process.env.MCP_ADMIN_TOKEN || null;
 
 if (!ADMIN_TOKEN) {
-  console.warn('[admin_routes] ⚠️  ADMIN_TOKEN tidak di-set! Admin UI tidak akan bisa diakses.');
+  const crypto = require('crypto');
+  ADMIN_TOKEN = crypto.randomBytes(16).toString('hex');
+  console.warn('[admin_routes] ⚠️  ADMIN_TOKEN tidak di-set! Generate fallback token untuk sesi ini:');
+  console.warn(`[admin_routes] 🔑 Token: ${ADMIN_TOKEN}`);
+  console.warn(`[admin_routes] Akses UI menggunakan header X-Admin-Token: ${ADMIN_TOKEN}`);
 }
 
 const router = express.Router();
+const crypto = require('crypto');
+
+// Simple IP-based rate limiter (30 requests / 60 seconds)
+const rateLimit = {};
+function adminRateLimiter(req, res, next) {
+  const ip = req.ip || req.connection.remoteAddress;
+  const now = Date.now();
+  if (!rateLimit[ip]) rateLimit[ip] = [];
+  rateLimit[ip] = rateLimit[ip].filter(time => now - time < 60000);
+  if (rateLimit[ip].length >= 30) {
+    return res.status(429).send(htmlError(429, 'Too Many Requests', 'Tunggu 1 menit.'));
+  }
+  rateLimit[ip].push(now);
+  next();
+}
+
+router.use(adminRateLimiter);
 
 // Middleware: verifikasi token
 function requireAdminToken(req, res, next) {
@@ -36,13 +57,20 @@ function requireAdminToken(req, res, next) {
     return res.status(503).send(htmlError(503, 'Admin UI belum dikonfigurasi',
       'ADMIN_TOKEN env var tidak di-set. Set di .env: ADMIN_TOKEN=<random-hex-string>'));
   }
-  const headerToken = req.get('X-Admin-Token');
-  const queryToken = req.query.token;
-  const provided = headerToken || queryToken;
-  if (provided !== ADMIN_TOKEN) {
+  const provided = req.get('X-Admin-Token');
+  if (!provided) {
     res.set('WWW-Authenticate', 'Bearer realm="admin"');
     return res.status(401).send(htmlError(401, 'Unauthorized',
-      'Butuh ADMIN_TOKEN yang valid. Kirim via header <code>X-Admin-Token</code> atau query <code>?token=...</code>'));
+      'Butuh ADMIN_TOKEN yang valid. Kirim via header <code>X-Admin-Token</code>.'));
+  }
+
+  // Prevent timing attacks and length mismatch errors
+  const providedHash = crypto.createHash('sha256').update(String(provided)).digest();
+  const tokenHash = crypto.createHash('sha256').update(String(ADMIN_TOKEN)).digest();
+
+  if (!crypto.timingSafeEqual(providedHash, tokenHash)) {
+    res.set('WWW-Authenticate', 'Bearer realm="admin"');
+    return res.status(401).send(htmlError(401, 'Unauthorized', 'Token tidak valid.'));
   }
   next();
 }
@@ -85,6 +113,7 @@ a:hover{text-decoration:underline;}
   <li><a href="/admin/search">🔍 Search memory per user</a><span class="tag">GET / POST</span></li>
   <li><a href="/admin/stats">📊 Stats & growth</a><span class="tag">GET</span></li>
   <li><a href="/admin/delete">🗑️ Delete memory (GDPR)</a><span class="tag">WAJIB konfirmasi</span></li>
+  <li><a href="/admin/undo">↩️ Undo Consolidation</a><span class="tag">Fase 4</span></li>
 </ul>
 <p style="margin-top:30px;font-size:12px;color:#666;">
   Memory AI Agent — Fase 6 (TASK-056). API:
@@ -343,5 +372,55 @@ function deleteResultHTML(scopeId, opts, result) {
 <p><a href="/admin/delete${tokenQS}">← Hapus user lain</a> | <a href="/admin/${tokenQS}">Dashboard</a></p>
 </body></html>`;
 }
+
+// =============================================================================
+// Undo Consolidation (Fase 4)
+// =============================================================================
+router.get('/undo', requireAdminToken, (req, res) => {
+  const tokenQS = `?token=${encodeURIComponent(ADMIN_TOKEN || '')}`;
+  res.send(`<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Undo Consolidation</title>
+<style>body{font-family:system-ui,sans-serif;max-width:700px;margin:30px auto;padding:0 20px;}
+h1{border-bottom:2px solid #333;padding-bottom:8px;}
+form{background:#f4f4f4;padding:20px;border-radius:8px;border:1px solid #ccc;}
+label{display:block;font-weight:600;margin-top:10px;}
+input{padding:8px;width:100%;box-sizing:border-box;border:1px solid #ccc;border-radius:4px;}
+button{padding:10px 24px;background:#06c;color:#fff;border:none;border-radius:4px;cursor:pointer;margin-top:15px;}
+.back{font-size:13px;}
+</style></head><body>
+<p class="back"><a href="/admin/${tokenQS}">← Dashboard</a></p>
+<h1>↩️ Undo Consolidation (Fase 4)</h1>
+<form method="POST" action="/admin/undo${tokenQS}">
+  <label>Merged Memory ID (ID dari durable memory hasil merge):</label>
+  <input name="merged_id" type="number" required>
+  <div style="margin-top:15px;"><button type="submit">↩️ Undo</button></div>
+</form>
+</body></html>`);
+});
+
+router.post('/undo', requireAdminToken, async (req, res) => {
+  const tokenQS = `?token=${encodeURIComponent(ADMIN_TOKEN || '')}`;
+  const mergedId = parseInt(req.body.merged_id, 10);
+  if (!mergedId) return res.status(400).send('Invalid ID');
+  try {
+    const result = await store.undoConsolidation(mergedId);
+    res.send(`<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Undo Success</title>
+<style>body{font-family:system-ui,sans-serif;max-width:700px;margin:30px auto;padding:0 20px;}
+.ok{background:#efe;border:1px solid #cfc;padding:20px;border-radius:6px;color:#060;margin:15px 0;}
+.back{font-size:13px;}
+</style></head><body>
+<p class="back"><a href="/admin/${tokenQS}">← Dashboard</a></p>
+<h1>↩️ Undo Success</h1>
+<div class="ok">
+  <p><b>Undo selesai untuk ID ${mergedId}</b></p>
+  <p>Berhasil me-restore <b>${result.restored_count}</b> original memories (ID: ${result.restored_ids.join(', ')}).</p>
+</div>
+</body></html>`);
+  } catch (e) {
+    res.status(500).send(`<!DOCTYPE html>
+<html><body><h1>Error</h1><p>${esc(e.message)}</p><a href="/admin/undo${tokenQS}">Kembali</a></body></html>`);
+  }
+});
 
 module.exports = router;

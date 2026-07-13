@@ -13,6 +13,7 @@ require('dotenv').config({ path: require('path').join(__dirname, '../../.env') }
 const FASTAPI_URL = process.env.FASTAPI_URL || 'http://localhost:8001/api/v1';
 const WEBHOOK_HOST = process.env.WEBHOOK_HOST || 'http://localhost:3001';
 const BRIEFING_GROUP_JID = process.env.BRIEFING_GROUP_JID || '120363426109888899@g.us';
+const BRIEFING_GROUP_NAME = process.env.BRIEFING_GROUP_NAME || 'Briefing Group';
 
 // ====================== SEND BRIEFING ======================
 async function sendBriefing(sock) {
@@ -34,13 +35,13 @@ async function sendBriefing(sock) {
       webhook_url: `${WEBHOOK_HOST}/webhook/whatsapp`,
       sender_id: null,
       sender_name: 'Briefing Bot',
-      group_name: 'GREEN GARDEN GHS'
+      group_name: BRIEFING_GROUP_NAME
     };
 
     const res = await axios.post(`${FASTAPI_URL}/briefing`, payload, {
       headers: {
         'Content-Type': 'application/json',
-        'X-Webhook-Secret': process.env.WEBHOOK_SECRET
+        'X-Webhook-Secret': process.env.WEBHOOK_SECRET || process.env.MCP_WEBHOOK_SECRET
       },
       timeout: 10000
     });

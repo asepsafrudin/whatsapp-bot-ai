@@ -579,6 +579,9 @@ async function mergeDurableMemories(memoryIds, opts = {}) {
 
   // Build content gabungan
   let mergedContent = winner.content;
+  if (mergeStrategy === 'replace_winner' && opts.replacementContent) {
+    mergedContent = opts.replacementContent;
+  }
   const mergedSourceIds = new Set(winner.source_memory_ids || []);
   for (const l of losers) {
     if (mergeStrategy === 'append') {
@@ -586,6 +589,7 @@ async function mergeDurableMemories(memoryIds, opts = {}) {
     } else if (mergeStrategy === 'longest' && l.content.length > mergedContent.length) {
       mergedContent = l.content;
     }
+    // Jika replace_winner, abaikan content dari loser karena sudah direplace
     if (Array.isArray(l.source_memory_ids)) {
       l.source_memory_ids.forEach((id) => mergedSourceIds.add(Number(id)));
     }
@@ -629,6 +633,44 @@ async function mergeDurableMemories(memoryIds, opts = {}) {
     merged_count: rows.length,
     new_version: newVersion,
   };
+}
+
+/**
+ * TASK-061 (Fase 4): Undo Consolidation
+ * Kembalikan memori-memori loser menjadi aktif (expires_at = NULL)
+ * dan hapus memori winner hasil merge.
+ * @param {number} mergedMemoryId 
+ * @returns {Promise<{restored_count: number, restored_ids: number[]}>}
+ */
+async function undoConsolidation(mergedMemoryId) {
+  if (!mergedMemoryId) throw new Error('[memory/store] undoConsolidation: butuh mergedMemoryId');
+  
+  // Ambil row winner
+  const selectSql = `SELECT id, source_memory_ids FROM whatsapp_bot.memories WHERE id = $1`;
+  const { rows } = await db.query(selectSql, [mergedMemoryId]);
+  if (rows.length === 0) throw new Error(`[memory/store] undoConsolidation: memory id=${mergedMemoryId} tidak ditemukan`);
+  
+  const winner = rows[0];
+  const sourceIds = Array.isArray(winner.source_memory_ids) ? winner.source_memory_ids : [];
+  if (sourceIds.length === 0) {
+    throw new Error(`[memory/store] undoConsolidation: memory id=${mergedMemoryId} tidak memiliki source_memory_ids (bukan hasil merge)`);
+  }
+
+  // Restore losers: set expires_at = NULL
+  const restoreSql = `
+    UPDATE whatsapp_bot.memories
+    SET expires_at = NULL,
+        metadata = metadata - 'merged_into' - 'soft_deleted_reason'
+    WHERE id = ANY($1::bigint[]) AND id != $2
+    RETURNING id
+  `;
+  const { rows: restoredRows } = await db.query(restoreSql, [sourceIds, mergedMemoryId]);
+
+  // Hard delete winner
+  await db.query(`DELETE FROM whatsapp_bot.memories WHERE id = $1`, [mergedMemoryId]);
+
+  console.log(`[memory/store] ↩️ Undo consolidation for id=${mergedMemoryId}, restored ${restoredRows.length} original memories`);
+  return { restored_count: restoredRows.length, restored_ids: restoredRows.map(r => r.id) };
 }
 
 /**
@@ -1067,6 +1109,7 @@ module.exports = {
   listDurableMemory,
   findSimilarDurable,
   mergeDurableMemories,
+  undoConsolidation,
   markConsolidated,
   runConsolidationJob,
   // TASK-056 (Fase 6) - Admin API
