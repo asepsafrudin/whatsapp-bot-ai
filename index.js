@@ -134,6 +134,10 @@ try {
 let sock;
 let cronBriefing, cronPurge, cronConsolidasi, cronImplicit, cronImplicitPurge;
 
+// REVIEW-FIX TASK-107: socket di-resolve lazy oleh queue — pesan yang di-enqueue
+// sebelum reconnect tetap dikirim memakai socket terbaru.
+sendQueue.setSockProvider(() => sock);
+
 // =============================================================================
 // PATCH STABILITAS P1 (2026-07-19)
 // =============================================================================
@@ -186,6 +190,22 @@ function isDuplicateMessage(msgId) {
     const oldest = processedMsgIds.values().next().value;
     processedMsgIds.delete(oldest);
   }
+  return false;
+}
+
+// REVIEW-FIX TASK-107 (B): idempotensi webhook — retry orchestrator (PATCH P1,
+// WEBHOOK_MAX_RETRY=3) untuk request_id yang sama TIDAK mengirim ulang balasan
+// ke user. Sebelumnya dedup hanya ada di lapisan memori, bukan pengiriman.
+const WEBHOOK_ID_TTL_MS = 10 * 60 * 1000;
+const recentWebhookIds = new Map(); // request_id -> timestamp (ms)
+function isDuplicateWebhook(requestId) {
+  if (!requestId) return false;
+  const now = Date.now();
+  for (const [id, ts] of recentWebhookIds) {
+    if (now - ts > WEBHOOK_ID_TTL_MS) recentWebhookIds.delete(id);
+  }
+  if (recentWebhookIds.has(requestId)) return true;
+  recentWebhookIds.set(requestId, now);
   return false;
 }
 
@@ -289,9 +309,16 @@ app.post('/webhook/whatsapp', async (req, res) => {
     if (request_id) disarmResponseWatchdog(request_id);
 
     if (sock && user_id && response) {
+      // REVIEW-FIX TASK-107 (B): dedup pengiriman by request_id — retry
+      // orchestrator tidak boleh mengirim balasan yang sama dua kali ke user.
+      if (isDuplicateWebhook(request_id)) {
+        console.log(`[Webhook] ⏭️ request_id=${request_id} sudah diproses, skip kirim (dedup).`);
+        return res.status(200).json({ success: true, deduplicated: true });
+      }
+
       // Format respon agar kompatibel dan maksimal di WhatsApp
       const formattedResponse = formatToWhatsApp(response);
-      
+
       const sendOptions = {};
       let finalResponse = formattedResponse;
       if (typeof user_id === 'string' && user_id.endsWith('@g.us') && sender_id) {
@@ -301,8 +328,11 @@ app.post('/webhook/whatsapp', async (req, res) => {
       }
       sendOptions.text = finalResponse;
 
-      // Kirim balasan ke WhatsApp (lewat antrean agar tidak kena ban/spam)
-      await sendQueue.enqueueMessage(sock, user_id, sendOptions);
+      // REVIEW-FIX TASK-107 (A): balas 200 SEGERA setelah enqueue ("accepted for
+      // delivery"). Menunggu pengiriman fisik bisa melebihi timeout 10s
+      // orchestrator saat antrean dalam → memicu retry P1 → balasan dobel.
+      sendQueue.enqueueMessage(sock, user_id, sendOptions)
+        .catch(e => console.error('[Webhook] Gagal kirim fisik balasan:', e.message));
       res.status(200).json({ success: true });
 
       // ========== TASK-048 Fase 1b + TASK-050 Fase 1d: Simpan assistant response ==========
@@ -674,9 +704,10 @@ async function startBot() {
           }
         } catch (cmdErr) {
           console.error('[Memory Command] Gagal:', cmdErr.message);
-          await sendQueue.enqueueMessage(sock, remoteJid, {
+          // REVIEW-FIX TASK-107: .catch agar kegagalan kirim tidak bocor ke unhandledRejection
+          sendQueue.enqueueMessage(sock, remoteJid, {
             text: `❌ Error: ${cmdErr.message}`,
-          }, { quoted: msg });
+          }, { quoted: msg }).catch(e => console.error('[SendQueue] Gagal kirim error command:', e.message));
           return;
         }
       }
@@ -814,9 +845,11 @@ async function startBot() {
     } catch (err) {
       console.error('Gagal mengirim ke FastAPI Backend:', err.message);
       disarmResponseWatchdog(requestId);  // PATCH STABILITAS P1: user sudah diberi tahu gagal
-      await sendQueue.enqueueMessage(sock, remoteJid, {
+      // REVIEW-FIX TASK-107: .catch agar kegagalan kirim pesan error tidak bocor
+      // ke unhandledRejection (misal saat socket down / antrean penuh).
+      sendQueue.enqueueMessage(sock, remoteJid, {
         text: '❌ Maaf, server AI sedang sibuk atau mati.',
-      });
+      }).catch(e => console.error('[SendQueue] Gagal kirim pesan error:', e.message));
     }
   });
 }
