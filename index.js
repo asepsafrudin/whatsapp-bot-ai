@@ -26,8 +26,14 @@ const WEBHOOK_HOST = process.env.WEBHOOK_HOST || 'http://localhost:3001';
 // Helper: baca WEBHOOK_SECRET dengan fallback MCP_WEBHOOK_SECRET (TASK-051)
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || process.env.MCP_WEBHOOK_SECRET;
 if (!WEBHOOK_SECRET) {
+  // PATCH STABILITAS P1: FAIL-FAST. Sebelumnya bot tetap berjalan tanpa secret,
+  // sehingga SEMUA request ditolak 403 dua arah (bot↔orchestrator) — gejalanya
+  // persis "bot tidak stabil", padahal miskonfigurasi. Lebih baik exit dan
+  // biarkan systemd merestart dengan log yang jelas.
   console.error('[Init] ❌ FATAL: WEBHOOK_SECRET / MCP_WEBHOOK_SECRET tidak diset di env.');
   console.error('[Init] Cek /home/aseps/MCP/config/env/.env.core atau .env.messaging');
+  console.error('[Init] Bot berhenti agar tidak berjalan dalam keadaan selalu gagal auth.');
+  process.exit(1);
 }
 
 // Inisialisasi Express Webhook Server
@@ -129,6 +135,87 @@ let sock;
 let cronBriefing, cronPurge, cronConsolidasi, cronImplicit, cronImplicitPurge;
 
 // =============================================================================
+// PATCH STABILITAS P1 (2026-07-19)
+// =============================================================================
+// (a) WATCHDOG balasan orchestrator: setelah ack "⏳ Sedang memproses..." terkirim,
+//     jika webhook balasan tidak datang dalam RESPONSE_WATCHDOG_MS, user diberi
+//     tahu (tidak ada lagi ack yang menggantung selamanya).
+// (b) DEDUP pesan: WhatsApp mengirim ulang pesan yang belum ter-ack setelah
+//     reconnect. Tanpa dedup, pesan diproses ulang → user menerima balasan dobel.
+// (c) RECONNECT GUARD: mencegah startBot() tumpang-tindih saat event 'close'
+//     terpanggil berulang (515 restartRequired, stream error, dll).
+// =============================================================================
+const RESPONSE_WATCHDOG_MS = parseInt(process.env.RESPONSE_WATCHDOG_MS || '60000', 10);
+const pendingRequests = new Map(); // requestId -> { remoteJid, timer }
+
+function armResponseWatchdog(requestId, remoteJid, quotedMsg) {
+  const timer = setTimeout(async () => {
+    if (pendingRequests.delete(requestId)) {
+      console.warn(`[Watchdog] ⏱️ Timeout ${RESPONSE_WATCHDOG_MS}ms menunggu balasan orchestrator (request_id=${requestId})`);
+      try {
+        await sock.sendMessage(remoteJid, {
+          text: '⚠️ Respons AI terlalu lama. Kemungkinan server sedang sibuk — silakan coba lagi.',
+        }, { quoted: quotedMsg });
+      } catch (e) {
+        console.warn('[Watchdog] Gagal kirim pesan timeout:', e.message);
+      }
+    }
+  }, RESPONSE_WATCHDOG_MS);
+  pendingRequests.set(requestId, { remoteJid, timer });
+}
+
+function disarmResponseWatchdog(requestId) {
+  const pend = pendingRequests.get(requestId);
+  if (pend) {
+    clearTimeout(pend.timer);
+    pendingRequests.delete(requestId);
+    return true;
+  }
+  return false;
+}
+
+const PROCESSED_MAX = 2000;
+const processedMsgIds = new Set();
+/** Return true jika pesan SUDAH pernah diproses (duplikat → harus di-skip). */
+function isDuplicateMessage(msgId) {
+  if (!msgId) return false;
+  if (processedMsgIds.has(msgId)) return true;
+  processedMsgIds.add(msgId);
+  // Prune FIFO sederhana agar Set tidak tumbuh tanpa batas
+  if (processedMsgIds.size > PROCESSED_MAX) {
+    const oldest = processedMsgIds.values().next().value;
+    processedMsgIds.delete(oldest);
+  }
+  return false;
+}
+
+let startBotInFlight = false;
+let reconnectTimer = null;
+function scheduleReconnect(delayMs) {
+  if (reconnectTimer) return; // sudah ada jadwal — abaikan pemicu berulang
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    startBotGuarded().catch(err => console.error('[Reconnect] startBot gagal:', err.message));
+  }, delayMs);
+}
+
+// Wrapper startBot dengan guard: mencegah 2+ socket Baileys tumpang-tindih
+// (penyebab balasan dobel & event handler ganda).
+async function startBotGuarded() {
+  if (startBotInFlight) {
+    console.log('[Reconnect] startBot sedang berjalan, abaikan pemanggilan ganda.');
+    return;
+  }
+  startBotInFlight = true;
+  try {
+    await startBot();
+  } finally {
+    startBotInFlight = false;
+  }
+}
+// =============================================================================
+
+// =============================================================================
 // TASK-056 (Fase 6): Mount admin Web UI routes
 // =============================================================================
 // Endpoint: /admin/* (search, stats, delete) — dilindungi ADMIN_TOKEN.
@@ -197,6 +284,9 @@ app.post('/webhook/whatsapp', async (req, res) => {
 
     const { user_id, response, request_id, sender_id } = req.body;  // TASK-050: terima request_id
     console.log(`[Webhook] Menerima balasan untuk: ${user_id} (request_id=${request_id || 'none'})`);
+
+    // PATCH STABILITAS P1: balasan dari orchestrator diterima → matikan watchdog
+    if (request_id) disarmResponseWatchdog(request_id);
 
     if (sock && user_id && response) {
       // Format respon agar kompatibel dan maksimal di WhatsApp
@@ -439,7 +529,17 @@ async function startBot() {
         'Koneksi terputus.',
         shouldReconnect ? 'Menyambung ulang...' : 'Logout. Hapus folder auth_info/ lalu jalankan ulang.'
       );
-      if (shouldReconnect) { setTimeout(startBot, 2000); }
+      // PATCH STABILITAS P1: reconnect terjadwal & ter-guard (tidak ada lagi
+      // setTimeout(startBot) ganda). 440 = conflict (sesi dibuka di tempat
+      // lain) → beri jeda lebih panjang agar tidak perang reconnect.
+      if (shouldReconnect) {
+        if (statusCode === 440) {
+          console.warn('[Reconnect] ⚠️ Conflict 440: sesi dibuka di tempat lain. Reconnect dalam 30s...');
+          scheduleReconnect(30000);
+        } else {
+          scheduleReconnect(statusCode === 515 ? 2000 : 5000);
+        }
+      }
     } else if (connection === 'open') {
       console.log('✅ Bot terhubung ke WhatsApp!');
 
@@ -541,6 +641,13 @@ async function startBot() {
       '';
 
     if (!text) return;
+
+    // PATCH STABILITAS P1: skip pesan duplikat. WhatsApp mengirim ulang pesan
+    // yang belum ter-ack setelah reconnect — tanpa ini user menerima balasan dobel.
+    if (isDuplicateMessage(msg.key?.id)) {
+      console.log(`[Dedup] ⏭️ Pesan ${msg.key?.id} sudah diproses, skip.`);
+      return;
+    }
 
     // ========== TASK-050 Fase 1d: Generate requestId untuk round-trip idempotency ==========
     const requestId = crypto.randomUUID();
@@ -648,6 +755,10 @@ async function startBot() {
       await sock.sendPresenceUpdate('composing', remoteJid);
       const ackMsg = await sock.sendMessage(remoteJid, { text: "⏳ Sedang memproses..." }, { quoted: msg });
 
+      // PATCH STABILITAS P1: aktifkan watchdog — jika balasan orchestrator tidak
+      // tiba tepat waktu, user diberi tahu (ack tidak menggantung selamanya).
+      armResponseWatchdog(requestId, remoteJid, msg);
+
       let groupName = null;
       let senderId = msg.key.participant || msg.key.remoteJid;
       let senderName = msg.pushName || null;
@@ -694,12 +805,14 @@ async function startBot() {
       await axios.post(FASTAPI_URL, payload, {
         headers: {
           'X-Webhook-Secret': WEBHOOK_SECRET
-        }
+        },
+        timeout: 15000,  // PATCH STABILITAS P1: jangan hang tanpa batas menunggu "queued"
       });
       console.log(`[API] Berhasil mengirim pesan ke Orchestrator (request_id=${requestId})`);
 
     } catch (err) {
       console.error('Gagal mengirim ke FastAPI Backend:', err.message);
+      disarmResponseWatchdog(requestId);  // PATCH STABILITAS P1: user sudah diberi tahu gagal
       await sock.sendMessage(remoteJid, {
         text: '❌ Maaf, server AI sedang sibuk atau mati.',
       });
@@ -707,4 +820,20 @@ async function startBot() {
   });
 }
 
-startBot();
+// PATCH STABILITAS P1: tangkap error startup secara eksplisit. Sebelumnya
+// `startBot()` tanpa .catch — kegagalan fetchLatestBaileysVersion() (network
+// down saat boot) menjadi unhandled rejection → Node exit tanpa log jelas →
+// crash-loop systemd (dan bisa kena start-limit → bot mati total).
+startBotGuarded().catch(err => {
+  console.error('[FATAL] startBot gagal saat startup:', err);
+  process.exit(1); // biarkan systemd merestart dengan log yang jelas
+});
+
+// Jangan biarkan rejection liar membunuh proses tanpa jejak.
+process.on('unhandledRejection', (reason) => {
+  console.error('[FATAL] Unhandled promise rejection:', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[FATAL] Uncaught exception:', err);
+  process.exit(1); // state tidak bisa dipercaya — restart bersih via systemd
+});

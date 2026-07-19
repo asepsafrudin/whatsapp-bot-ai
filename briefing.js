@@ -10,7 +10,12 @@ const axios = require('axios');
 require('dotenv').config({ path: require('path').join(__dirname, '../../.env') });
 
 // ====================== CONFIGURATION ======================
-const FASTAPI_URL = process.env.FASTAPI_URL || 'http://localhost:8001/api/v1';
+// PATCH STABILITAS P1: FASTAPI_URL di index.js diperlakukan sebagai FULL PATH
+// (default .../api/v1/chat), sedangkan briefing.js dulu meng-append '/briefing'
+// ke var yang sama -> request ke '/api/v1/chat/briefing' -> 404.
+// Solusi: normalisasi ke BASE URL '/api/v1', terlepas dari bentuk env-nya.
+const _rawFastapiUrl = process.env.FASTAPI_URL || 'http://localhost:8001/api/v1/chat';
+const FASTAPI_URL = _rawFastapiUrl.replace(/\/api\/v1\/chat\/?$/, '/api/v1').replace(/\/$/, '');
 const WEBHOOK_HOST = process.env.WEBHOOK_HOST || 'http://localhost:3001';
 const BRIEFING_GROUP_JID = process.env.BRIEFING_GROUP_JID || '120363426109888899@g.us';
 const BRIEFING_GROUP_NAME = process.env.BRIEFING_GROUP_NAME || 'Briefing Group';
