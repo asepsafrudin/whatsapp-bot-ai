@@ -14,9 +14,9 @@ const briefing = require('./briefing');
 // TASK-047 Fase 1a: Modul memori (PostgreSQL-backed)
 const memoryStore = require('./memory/store');
 const memoryRouter = require('./memory/router');
-// TASK-053: DB pool untuk contacts.upsert real-time → public.member_profiles
 const memoryDb = require('./memory/db');
 const { formatToWhatsApp } = require('./formatter');
+const sendQueue = require('./send_queue');
 
 // Konfigurasi API
 const FASTAPI_URL = process.env.FASTAPI_URL || 'http://localhost:8001/api/v1/chat';
@@ -153,7 +153,7 @@ function armResponseWatchdog(requestId, remoteJid, quotedMsg) {
     if (pendingRequests.delete(requestId)) {
       console.warn(`[Watchdog] ⏱️ Timeout ${RESPONSE_WATCHDOG_MS}ms menunggu balasan orchestrator (request_id=${requestId})`);
       try {
-        await sock.sendMessage(remoteJid, {
+        await sendQueue.enqueueMessage(sock, remoteJid, {
           text: '⚠️ Respons AI terlalu lama. Kemungkinan server sedang sibuk — silakan coba lagi.',
         }, { quoted: quotedMsg });
       } catch (e) {
@@ -301,8 +301,8 @@ app.post('/webhook/whatsapp', async (req, res) => {
       }
       sendOptions.text = finalResponse;
 
-      // Kirim balasan ke WhatsApp
-      await sock.sendMessage(user_id, sendOptions);
+      // Kirim balasan ke WhatsApp (lewat antrean agar tidak kena ban/spam)
+      await sendQueue.enqueueMessage(sock, user_id, sendOptions);
       res.status(200).json({ success: true });
 
       // ========== TASK-048 Fase 1b + TASK-050 Fase 1d: Simpan assistant response ==========
@@ -668,13 +668,13 @@ async function startBot() {
         try {
           const reply = await handleMemoryCommand(routerResult, text);
           if (reply) {
-            await sock.sendMessage(remoteJid, { text: reply }, { quoted: msg });
+            await sendQueue.enqueueMessage(sock, remoteJid, { text: reply }, { quoted: msg });
             console.log(`[Memory Command] ✅ Replied to ${remoteJid}: ${reply.split('\n')[0]}`);
             return;  // jangan forward ke orchestrator
           }
         } catch (cmdErr) {
           console.error('[Memory Command] Gagal:', cmdErr.message);
-          await sock.sendMessage(remoteJid, {
+          await sendQueue.enqueueMessage(sock, remoteJid, {
             text: `❌ Error: ${cmdErr.message}`,
           }, { quoted: msg });
           return;
@@ -753,10 +753,11 @@ async function startBot() {
 
     try {
       await sock.sendPresenceUpdate('composing', remoteJid);
-      const ackMsg = await sock.sendMessage(remoteJid, { text: "⏳ Sedang memproses..." }, { quoted: msg });
+      const ackMsg = await sendQueue.enqueueMessage(sock, remoteJid, { text: "⏳ Sedang memproses..." }, { quoted: msg });
 
       // PATCH STABILITAS P1: aktifkan watchdog — jika balasan orchestrator tidak
       // tiba tepat waktu, user diberi tahu (ack tidak menggantung selamanya).
+      // Catatan: Karena await sendQueue, watchdog di-arm setelah pesan benar-benar terkirim ke jaringan.
       armResponseWatchdog(requestId, remoteJid, msg);
 
       let groupName = null;
@@ -813,7 +814,7 @@ async function startBot() {
     } catch (err) {
       console.error('Gagal mengirim ke FastAPI Backend:', err.message);
       disarmResponseWatchdog(requestId);  // PATCH STABILITAS P1: user sudah diberi tahu gagal
-      await sock.sendMessage(remoteJid, {
+      await sendQueue.enqueueMessage(sock, remoteJid, {
         text: '❌ Maaf, server AI sedang sibuk atau mati.',
       });
     }
