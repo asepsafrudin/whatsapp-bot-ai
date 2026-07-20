@@ -1,8 +1,9 @@
 require('dotenv').config({ path: '../../.env' });
 const {
-  default: makeWASocket,
+  makeWASocket,
   useMultiFileAuthState,
-  DisconnectReason
+  DisconnectReason,
+  Browsers
 } = require('@whiskeysockets/baileys');
 const qrcode = require('qrcode-terminal');
 const P = require('pino');
@@ -508,7 +509,8 @@ async function handleMemoryCommand(routerResult, rawText) {
 
 // Inisialisasi Baileys WhatsApp Bot
 async function startBot() {
-  const { state, saveCreds } = await useMultiFileAuthState('auth_info');
+  const authDir = process.env.AUTH_INFO_DIR || 'auth_info';
+  const { state, saveCreds } = await useMultiFileAuthState(authDir);
   const { fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
   const { version, isLatest } = await fetchLatestBaileysVersion();
   console.log(`Menggunakan WA v${version.join('.')}, isLatest: ${isLatest}`);
@@ -518,7 +520,7 @@ async function startBot() {
     auth: state,
     printQRInTerminal: false,
     logger: P({ level: 'silent' }),
-    browser: ['Mac OS', 'chrome', '121.0.6167.159'],
+    browser: Browsers.macOS('Desktop'),
     syncFullHistory: false,
   });
 
