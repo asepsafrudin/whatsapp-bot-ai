@@ -603,23 +603,46 @@ async function startBot() {
         }];
       }
 
+      // REVIEW-FIX TASK-108 (minor): dedup target by jid — entri ganda di
+      // BRIEFING_TARGETS tidak boleh mengirim briefing 2x ke grup yang sama.
+      {
+        const seenJids = new Set();
+        briefingTargets = briefingTargets.filter(t => {
+          if (!t || !t.jid) return false;
+          if (seenJids.has(t.jid)) {
+            console.warn(`[Briefing] ⏭️ Target duplikat di-skip: ${t.name || t.jid} (${t.jid})`);
+            return false;
+          }
+          seenJids.add(t.jid);
+          return true;
+        });
+      }
+
       console.log(`[Briefing] Menjadwalkan briefing pagi untuk ${briefingTargets.length} target...`);
       briefingTargets.forEach((target, index) => {
         const cronExpr = target.cron || '0 8 * * 1-5';
         console.log(`  -> Target ${index + 1}: ${target.name} (${target.jid}) pada cron "${cronExpr}"`);
         
-        const job = cron.schedule(cronExpr, () => {
-          console.log(`[Briefing] Trigger jadwal briefing untuk ${target.name}!`);
-          briefing.sendBriefing(sock, target).then(result => {
-            if (result.success) {
-              console.log(`[Briefing] ✅ Briefing pagi untuk ${target.name} berhasil dikirim.`);
-            } else {
-              console.error(`[Briefing] ❌ Briefing pagi untuk ${target.name} gagal:`, result.error);
-            }
+        // REVIEW-FIX TASK-108 (minor): cron tidak valid pada satu target tidak
+        // boleh menggagalkan penjadwalan target lainnya.
+        let job;
+        try {
+          job = cron.schedule(cronExpr, () => {
+            console.log(`[Briefing] Trigger jadwal briefing untuk ${target.name}!`);
+            briefing.sendBriefing(sock, target).then(result => {
+              if (result.success) {
+                console.log(`[Briefing] ✅ Briefing pagi untuk ${target.name} berhasil dikirim.`);
+              } else {
+                console.error(`[Briefing] ❌ Briefing pagi untuk ${target.name} gagal:`, result.error);
+              }
+            });
+          }, {
+            timezone: 'Asia/Jakarta'
           });
-        }, {
-          timezone: 'Asia/Jakarta'
-        });
+        } catch (cronErr) {
+          console.error(`[Briefing] ❌ Cron tidak valid untuk ${target.name}: "${cronExpr}" — target di-skip.`, cronErr.message);
+          return;
+        }
         
         cronBriefingJobs.push(job);
       });
