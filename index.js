@@ -15,6 +15,8 @@ const briefing = require('./briefing');
 const memoryStore = require('./memory/store');
 const memoryRouter = require('./memory/router');
 const memoryDb = require('./memory/db');
+// TASK-108 (review follow-up, opsi A): konfigurasi grup briefing dari DB
+const groupConfig = require('./memory/group_config');
 const { formatToWhatsApp } = require('./formatter');
 const sendQueue = require('./send_queue');
 
@@ -544,7 +546,7 @@ async function startBot() {
     // =====================================================
   });
 
-  sock.ev.on('connection.update', (update) => {
+  sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
@@ -601,6 +603,26 @@ async function startBot() {
           cron: process.env.BRIEFING_CRON || '0 8 * * 1-5',
           context: null
         }];
+      }
+
+      // TASK-108 (review follow-up, opsi A): gabungkan grup aktif dari DB
+      // whatsapp_bot.group_configs dengan target env. Dedup by jid diterapkan
+      // setelahnya — target ENV menang atas DB bila jid sama.
+      try {
+        const dbGroups = await groupConfig.getActiveBriefingGroups();
+        if (dbGroups.length > 0) {
+          const envCount = briefingTargets.length;
+          const mapped = dbGroups.map(g => ({
+            jid: g.group_id,
+            name: g.group_name,
+            context: g.briefing_characteristics || null,
+            cron: null,  // DB belum menyimpan jadwal — pakai default
+          }));
+          briefingTargets = briefingTargets.concat(mapped);
+          console.log(`[Briefing] Gabungan target: ${envCount} env + ${mapped.length} DB`);
+        }
+      } catch (dbErr) {
+        console.warn('[Briefing] ⚠️ Gagal membaca group_configs (lanjut env-only):', dbErr.message);
       }
 
       // REVIEW-FIX TASK-108 (minor): dedup target by jid — entri ganda di
