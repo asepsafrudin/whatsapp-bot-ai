@@ -17,12 +17,16 @@ require('dotenv').config({ path: require('path').join(__dirname, '../../.env') }
 const _rawFastapiUrl = process.env.FASTAPI_URL || 'http://localhost:8001/api/v1/chat';
 const FASTAPI_URL = _rawFastapiUrl.replace(/\/api\/v1\/chat\/?$/, '/api/v1').replace(/\/$/, '');
 const WEBHOOK_HOST = process.env.WEBHOOK_HOST || 'http://localhost:3001';
-const BRIEFING_GROUP_JID = process.env.BRIEFING_GROUP_JID || '120363426109888899@g.us';
-const BRIEFING_GROUP_NAME = process.env.BRIEFING_GROUP_NAME || 'Briefing Group';
+const DEFAULT_BRIEFING_GROUP_JID = process.env.BRIEFING_GROUP_JID || '120363426109888899@g.us';
+const DEFAULT_BRIEFING_GROUP_NAME = process.env.BRIEFING_GROUP_NAME || 'Briefing Group';
 
 // ====================== SEND BRIEFING ======================
-async function sendBriefing(sock) {
-  console.log('[Briefing] Memulai proses briefing WhatsApp pagi...');
+async function sendBriefing(sock, target = null) {
+  const jid = target?.jid || DEFAULT_BRIEFING_GROUP_JID;
+  const name = target?.name || DEFAULT_BRIEFING_GROUP_NAME;
+  const ctx = target?.context || null;
+
+  console.log(`[Briefing] Memulai proses briefing WhatsApp pagi untuk grup: ${name} (${jid})...`);
 
   if (!sock) {
     console.error('[Briefing] Socket Baileys belum tersedia. Briefing dibatalkan.');
@@ -31,17 +35,20 @@ async function sendBriefing(sock) {
 
   try {
     console.log(`[Briefing] Mengirim request generate briefing ke ai-orchestrator: ${FASTAPI_URL}/briefing`);
-    console.log(`[Briefing] Target grup: ${BRIEFING_GROUP_JID}`);
 
     const payload = {
       platform: 'whatsapp',
-      user_id: BRIEFING_GROUP_JID,
+      user_id: jid,
       message: 'GENERATE_MORNING_BRIEFING',
       webhook_url: `${WEBHOOK_HOST}/webhook/whatsapp`,
       sender_id: null,
       sender_name: 'Briefing Bot',
-      group_name: BRIEFING_GROUP_NAME
+      group_name: name
     };
+    
+    if (ctx) {
+      payload.context = ctx;
+    }
 
     const res = await axios.post(`${FASTAPI_URL}/briefing`, payload, {
       headers: {

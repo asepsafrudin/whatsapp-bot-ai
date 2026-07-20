@@ -132,7 +132,8 @@ try {
 }
 
 let sock;
-let cronBriefing, cronPurge, cronConsolidasi, cronImplicit, cronImplicitPurge;
+let cronBriefingJobs = [];
+let cronPurge, cronConsolidasi, cronImplicit, cronImplicitPurge;
 
 // REVIEW-FIX TASK-107: socket di-resolve lazy oleh queue — pesan yang di-enqueue
 // sebelum reconnect tetap dikirim memakai socket terbaru.
@@ -574,21 +575,53 @@ async function startBot() {
       console.log('✅ Bot terhubung ke WhatsApp!');
 
       // ===== SCHEDULER BRIEFING PAGI =====
-      const BRIEFING_CRON = process.env.BRIEFING_CRON || '0 8 * * 1-5';
-      console.log(`[Briefing] Menjadwalkan briefing pagi: cron="${BRIEFING_CRON}" ke grup ${process.env.BRIEFING_GROUP_JID || '120363426109888899@g.us'}`);
+      if (cronBriefingJobs && cronBriefingJobs.length > 0) {
+        cronBriefingJobs.forEach(job => job.stop());
+        cronBriefingJobs = [];
+      }
+      
+      let briefingTargets = [];
+      try {
+        if (process.env.BRIEFING_TARGETS) {
+          briefingTargets = JSON.parse(process.env.BRIEFING_TARGETS);
+        } else {
+          // Fallback backward-compatible
+          briefingTargets = [{
+            jid: process.env.BRIEFING_GROUP_JID || '120363426109888899@g.us',
+            name: process.env.BRIEFING_GROUP_NAME || 'Briefing Group',
+            cron: process.env.BRIEFING_CRON || '0 8 * * 1-5',
+            context: null
+          }];
+        }
+      } catch (err) {
+        console.error('[Init] ❌ Gagal parse BRIEFING_TARGETS JSON. Menggunakan fallback.', err.message);
+        briefingTargets = [{
+          jid: process.env.BRIEFING_GROUP_JID || '120363426109888899@g.us',
+          name: process.env.BRIEFING_GROUP_NAME || 'Briefing Group',
+          cron: process.env.BRIEFING_CRON || '0 8 * * 1-5',
+          context: null
+        }];
+      }
 
-      if (cronBriefing) cronBriefing.stop();
-      cronBriefing = cron.schedule(BRIEFING_CRON, () => {
-        console.log('[Briefing] Trigger jadwal briefing!');
-        briefing.sendBriefing(sock).then(result => {
-          if (result.success) {
-            console.log('[Briefing] ✅ Briefing pagi berhasil dikirim.');
-          } else {
-            console.error('[Briefing] ❌ Briefing pagi gagal:', result.error);
-          }
+      console.log(`[Briefing] Menjadwalkan briefing pagi untuk ${briefingTargets.length} target...`);
+      briefingTargets.forEach((target, index) => {
+        const cronExpr = target.cron || '0 8 * * 1-5';
+        console.log(`  -> Target ${index + 1}: ${target.name} (${target.jid}) pada cron "${cronExpr}"`);
+        
+        const job = cron.schedule(cronExpr, () => {
+          console.log(`[Briefing] Trigger jadwal briefing untuk ${target.name}!`);
+          briefing.sendBriefing(sock, target).then(result => {
+            if (result.success) {
+              console.log(`[Briefing] ✅ Briefing pagi untuk ${target.name} berhasil dikirim.`);
+            } else {
+              console.error(`[Briefing] ❌ Briefing pagi untuk ${target.name} gagal:`, result.error);
+            }
+          });
+        }, {
+          timezone: 'Asia/Jakarta'
         });
-      }, {
-        timezone: 'Asia/Jakarta'
+        
+        cronBriefingJobs.push(job);
       });
 
       // ===== SCHEDULER PURGE MEMORY EXPIRED (TASK-047) =====
